@@ -1,20 +1,24 @@
 use std::num::NonZeroUsize;
 
 use bitvec::vec::BitVec;
-use uuid::Uuid;
+use rkyv::AlignedVec;
 
-use super::{PacketReceiveErrorKind, ReceivedPacketAck, SeqIndex, SeqIndexOutOfRange, SeqKind};
+use super::{
+    PacketId, PacketReceiveErrorKind, ReceivedPacketAck, SeqIndex, SeqIndexOutOfRange, SeqKind,
+};
 
 /// Reassembles received packets.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct ReassembledPacket {
     /// A buffer for the payload.
     ///
     /// Slightly bigger than necessary, since only the number of chunks is known.
-    payload: Box<[u8]>,
+    payload: AlignedVec,
     /// Set to the proper length of the payload once the last packet is received.
     payload_len: Option<NonZeroUsize>,
     /// Which chunks have been received so far.
+    ///
+    /// TODO: Replace with list of ranges since packets usually come in order
     received_chunks: BitVec,
     /// How many chunks have been received so far.
     ///
@@ -26,7 +30,7 @@ impl ReassembledPacket {
     pub(crate) fn new(seq_kind: SeqKind, seq_max: SeqIndex) -> Self {
         let len = usize::try_from(seq_max).unwrap() + 1;
         Self {
-            payload: vec![0; len * seq_kind.chunk_size()].into_boxed_slice(),
+            payload: AlignedVec::with_capacity(len * seq_kind.chunk_size()),
             payload_len: None,
             received_chunks: BitVec::repeat(false, usize::try_from(seq_max).unwrap()),
             received_count: 0,
@@ -35,7 +39,7 @@ impl ReassembledPacket {
 
     pub(crate) fn receive(
         &mut self,
-        id: Uuid,
+        id: PacketId,
         seq_kind: SeqKind,
         seq_index: SeqIndex,
         payload: &[u8],
@@ -59,7 +63,15 @@ impl ReassembledPacket {
                 );
             }
 
-            self.payload[offset..offset + payload.len()].copy_from_slice(payload);
+            if offset < self.payload.len() {
+                self.payload[offset..offset + payload.len()].copy_from_slice(payload);
+            } else {
+                if offset > self.payload.len() {
+                    self.payload.resize(offset, 0);
+                }
+                self.payload.extend_from_slice(payload);
+            }
+
             if usize::try_from(self.received_count).unwrap() == self.received_chunks.len() - 1 {
                 Ok(ReceivedPacketAck::Done(&self.payload))
             } else {

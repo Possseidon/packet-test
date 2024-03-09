@@ -3,13 +3,19 @@ mod send;
 
 use std::{
     collections::{btree_map::Entry, BTreeMap},
+    convert::Infallible,
     io,
+    marker::PhantomData,
     mem::size_of,
-    num::{NonZeroU8, NonZeroUsize},
+    num::{NonZeroU16, NonZeroU8, NonZeroUsize},
     time::{Duration, Instant},
 };
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use rkyv::{
+    ser::{serializers::AlignedSerializer, Serializer},
+    AlignedVec, Archive, Serialize,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -20,32 +26,206 @@ pub const PACKET_BUFFER_SIZE: usize = 512;
 /// The max size for the data section of a packet, i.e. without the single kind byte.
 pub const PACKET_DATA_SIZE: usize = PACKET_BUFFER_SIZE - size_of::<PacketKind>();
 
-pub type NonZeroBatchSize = NonZeroU8;
-pub type BatchSize = u8;
+pub type NonZeroBufferIndex = NonZeroU16;
+pub type BufferIndex = u16;
 
-// TODO: Use this instead of raw uuids
+/// Various packet types that are used by server and client to communicate with each other.
+///
+/// While it is technically possible to use the same packet type for both server and client, I
+/// generally recommend against it.
+pub trait Packets {
+    /// Packets sent by the server.
+    type Server: ConnectionPacket<ServerConnectionPacket>;
+    /// Packets sent by the client.
+    type Client: ConnectionPacket<ClientConnectionPacket>;
+
+    /// Update packets sent by the server.
+    type ServerUpdate: UpdatePacket;
+    /// Update packets sent by the client.
+    type ClientUpdate: UpdatePacket;
+}
+
+/// Contains only the necessary packets to establish a connection between server and client.
+struct DefaultPackets;
+
+impl Packets for DefaultPackets {
+    type Server = ServerConnectionPacket;
+    type Client = ClientConnectionPacket;
+
+    type ServerUpdate = NoUpdate;
+    type ClientUpdate = NoUpdate;
+}
+
+pub trait Packet: Serialize<AlignedSerializer<AlignedVec>> {}
+impl<T: Serialize<AlignedSerializer<AlignedVec>>> Packet for T {}
+
+/// Packets that can also be checked for server/client connection information.
+pub trait ConnectionPacket<T: Packet>: Packet {
+    fn connection_packet(&self) -> Option<T>;
+}
+
+/// Server packets for dealing with client connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize)]
+pub enum ServerConnectionPacket {
+    Accept,
+    Reject,
+    Kick,
+}
+
+impl ConnectionPacket<ServerConnectionPacket> for ServerConnectionPacket {
+    fn connection_packet(&self) -> Option<ServerConnectionPacket> {
+        Some(*self)
+    }
+}
+
+/// Client packets for establishing a server connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize)]
+pub enum ClientConnectionPacket {
+    Connect,
+    Disconnect,
+}
+
+impl ConnectionPacket<ClientConnectionPacket> for ClientConnectionPacket {
+    fn connection_packet(&self) -> Option<ClientConnectionPacket> {
+        Some(*self)
+    }
+}
+
+pub enum NoUpdate {}
+
+#[derive(Debug, Error)]
+#[error("there are no update packets")]
+pub struct NoUpdateError;
+
+impl UpdatePacket for NoUpdate {
+    type ReadError = NoUpdateError;
+
+    fn write(&self, _buf: &mut [u8]) -> Option<NonZeroUsize> {
+        unreachable!()
+    }
+
+    fn read(_buf: &[u8]) -> Result<(usize, Self), Self::ReadError> {
+        Err(NoUpdateError)
+    }
+}
+
+/// Packets for things that constantly change, which means it's okay if some are dropped.
+///
+/// These packets must fit into a single datagram.
+pub trait UpdatePacket: Sized {
+    type ReadError: std::error::Error;
+
+    /// Lower bound for the size of the packet.
+    ///
+    /// Used as an upfront check to see if the packet might fit in the remaining buffer.
+    ///
+    /// Must be at most [`PACKET_BUFFER_SIZE`].
+    fn min_size(&self) -> NonZeroBufferIndex {
+        NonZeroBufferIndex::MIN
+    }
+
+    /// Writes the packet to the given buffer and returns the number of bytes written.
+    ///
+    /// The first byte must be at least [`PacketKind::FirstUpdate`]s.
+    ///
+    /// Returns [`None`] if there isn't enough space, but must not return [`None`] if `buf` is
+    /// [`PACKET_BUFFER_SIZE`] bytes long.
+    fn write(&self, buf: &mut [u8]) -> Option<NonZeroUsize>;
+
+    /// Reads a packet from the given buffer.
+    ///
+    /// Returns the number of bytes that were read from `buf`.
+    fn read(buf: &[u8]) -> Result<(usize, Self), Self::ReadError>;
+}
+
+pub type NonZeroBatchSize = NonZeroU16;
+pub type BatchSize = u16;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PacketId(Uuid);
 
+impl PacketId {
+    fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+
+    fn from_slice(bytes: &[u8]) -> Option<Self> {
+        Uuid::from_slice(bytes).ok().map(Self)
+    }
+}
+
+pub struct PacketBuffers<S: Packet, R: Packet> {
+    send_buffer: SendPacketBuffer,
+    receive_buffer: ReceivePacketBuffer,
+    _phantom: PhantomData<fn() -> (S, R)>,
+}
+
+impl<S: Packet, R: Packet> PacketBuffers<S, R> {
+    pub fn new(initial_send_batch_size: NonZeroBatchSize) -> Self {
+        Self {
+            send_buffer: SendPacketBuffer::new(initial_send_batch_size),
+            receive_buffer: Default::default(),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn send(&mut self, packet: &S, send: impl SendPacket) -> io::Result<PacketId> {
+        let mut serializer = AlignedSerializer::default();
+        serializer.serialize_value(packet).unwrap();
+        self.send_buffer.send(serializer.into_inner(), send)
+    }
+}
+
+impl<S: Packet, R: Packet> Clone for PacketBuffers<S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            send_buffer: self.send_buffer.clone(),
+            receive_buffer: self.receive_buffer.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<S: Packet, R: Packet> std::fmt::Debug for PacketBuffers<S, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketBuffers")
+            .field("send_buffer", &self.send_buffer)
+            .field("receive_buffer", &self.receive_buffer)
+            .finish()
+    }
+}
+
 /// Sent packets that are not yet fully acked.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SendPacketBuffer {
-    packets: BTreeMap<Uuid, PacketOut>,
+#[derive(Clone, Debug)]
+struct SendPacketBuffer {
+    // TODO: Update batch_size somehow
+    batch_size: NonZeroBatchSize,
+    packets: BTreeMap<PacketId, PacketOut>,
 }
 
 impl SendPacketBuffer {
     /// Creates a new [`SentPacketBuffer`] without any sent packets.
-    pub fn new() -> Self {
-        Self::default()
+    fn new(initial_batch_size: NonZeroBatchSize) -> Self {
+        Self {
+            batch_size: initial_batch_size,
+            packets: Default::default(),
+        }
     }
 
     /// Handles incoming packets that are relevant for the sent packet buffer.
     ///
     /// Which is just [`PacketKind::Ack`], other packets are ignored.
-    pub fn handle(
+    fn handle(
         &mut self,
         buffer: &[u8],
         send: impl SendPacket,
     ) -> Result<SentPacketHandling, PacketSendError> {
+        todo!();
+
         let id;
         let seq_index;
         Ok(SentPacketHandling::Ack(
@@ -55,24 +235,16 @@ impl SendPacketBuffer {
     }
 
     /// Sends a new packet and returns its id for tracking purposes.
-    pub fn send(
-        &mut self,
-        payload: Vec<u8>,
-        send: impl SendPacket,
-        initial_batch_size: NonZeroBatchSize,
-    ) -> io::Result<Uuid> {
-        let id = Uuid::new_v4();
-        let packet = PacketOut::send(id, payload, send, initial_batch_size)?;
+    fn send(&mut self, payload: AlignedVec, send: impl SendPacket) -> io::Result<PacketId> {
+        let id = PacketId::new();
+        let packet = PacketOut::send(id, payload, send, self.batch_size)?;
         self.packets.insert(id, packet);
         Ok(id)
     }
 
     /// Sends out still pending packet parts.
-    pub fn send_pending(
-        &mut self,
-        send: impl SendPacket,
-        resend_delay: Duration,
-    ) -> io::Result<()> {
+    fn send_pending(&mut self, send: impl SendPacket, resend_delay: Duration) -> io::Result<()> {
+        todo!();
         for (id, packet) in &self.packets {
             packet.send_pending(*id, send, resend_delay)?;
         }
@@ -80,9 +252,9 @@ impl SendPacketBuffer {
     }
 
     /// Returns statistics about the packet with the given id.
-    pub fn stats(
+    fn stats(
         &self,
-        id: Uuid,
+        id: PacketId,
         resend_delay: Duration,
     ) -> Result<PacketOutStats, InvalidPacketId> {
         let packet = self.packets.get(&id).ok_or(InvalidPacketId { id })?;
@@ -99,7 +271,7 @@ impl SendPacketBuffer {
     /// Sends out [`PacketKind::Done`] and removes the packet if all parts of the packet were acked.
     fn ack(
         &mut self,
-        id: Uuid,
+        id: PacketId,
         seq_index: SeqIndex,
         send: impl SendPacket,
     ) -> Result<SentPacketAck, PacketSendErrorKind> {
@@ -110,7 +282,7 @@ impl SendPacketBuffer {
         let ack = packet.ack(seq_index)?;
         if let SentPacketAck::Done = ack {
             let mut done = [0; 17];
-            done[0] = PacketKind::Done as PacketKindInt;
+            done[0] = PacketKind::Done.into();
             done[1..17].copy_from_slice(id.as_bytes());
             send(&done)?;
             self.packets.remove(&id);
@@ -119,7 +291,7 @@ impl SendPacketBuffer {
     }
 
     /// Forget packets that did not receive acks in a long time.
-    pub fn timeout_packets(&mut self, timeout: Duration) {
+    fn timeout_packets(&mut self, timeout: Duration) {
         self.packets
             .retain(|_, packet| packet.awaiting_ack_since().elapsed() < timeout);
     }
@@ -137,9 +309,9 @@ pub enum SentPacketAck {
 }
 
 #[derive(Debug, Error)]
-#[error("{kind} (id: {id})")]
+#[error("{id:?} {kind}")]
 pub struct PacketSendError {
-    pub id: Uuid,
+    pub id: PacketId,
     pub kind: PacketSendErrorKind,
 }
 
@@ -166,14 +338,14 @@ pub struct PacketOutStats {
 }
 
 /// Received packets to be reassembled.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReceivePacketBuffer {
-    packets: BTreeMap<Uuid, PacketIn>,
+#[derive(Clone, Debug, Default)]
+struct ReceivePacketBuffer {
+    packets: BTreeMap<PacketId, PacketIn>,
 }
 
 impl ReceivePacketBuffer {
     /// Creates a new [`ReceivedPacketBuffer`] without any received packets.
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
@@ -189,18 +361,18 @@ impl ReceivePacketBuffer {
     /// - [`PacketKind::Done`]
     ///
     /// Other packets are ignored.
-    pub fn handle(
+    fn handle(
         &mut self,
         buffer: &[u8],
         send: impl SendPacket,
     ) -> Result<ReceivedPacketHandling, HandleReceivedPacketError> {
         let kind = buffer.get(0).expect("payload must not be empty");
         if let Ok(kind) = PacketKind::try_from(*kind) {
-            if let PacketKind::Ack | PacketKind::FirstUnreliable = kind {
+            if let PacketKind::Ack | PacketKind::FirstUpdate = kind {
                 return Ok(ReceivedPacketHandling::Unhandled);
             }
 
-            let id = Uuid::from_slice(
+            let id = PacketId::from_slice(
                 buffer
                     .get(1..17)
                     .ok_or(HandleReceivedPacketError::Malformed)?,
@@ -217,7 +389,7 @@ impl ReceivePacketBuffer {
                 PacketKind::PartU8 => SeqKind::U8,
                 PacketKind::PartU16 => SeqKind::U16,
                 PacketKind::PartU32 => SeqKind::U32,
-                PacketKind::Ack | PacketKind::Done | PacketKind::FirstUnreliable => unreachable!(),
+                PacketKind::Ack | PacketKind::Done | PacketKind::FirstUpdate => unreachable!(),
             };
 
             let seq_index;
@@ -233,15 +405,15 @@ impl ReceivePacketBuffer {
     }
 
     /// Reassembles the given packet and returns its state.
-    pub fn receive(
-        &mut self,
-        id: Uuid,
+    fn receive<'a>(
+        &'a mut self,
+        id: PacketId,
         seq_kind: SeqKind,
         seq_index: SeqIndex,
         seq_max: SeqIndex,
-        payload: &[u8],
+        payload: &'a [u8],
         send: impl SendPacket,
-    ) -> Result<ReceivedPacketAck, PacketReceiveError> {
+    ) -> Result<ReceivedPacketAck<'a>, PacketReceiveError> {
         if seq_max == 0 {
             match self.packets.entry(id) {
                 Entry::Vacant(entry) => {
@@ -285,7 +457,7 @@ impl ReceivePacketBuffer {
     }
 
     /// The sender is aware that all packets have been received, so the id can be removed.
-    pub fn done(&mut self, id: Uuid) -> Result<(), InvalidPacketId> {
+    fn done(&mut self, id: PacketId) -> Result<(), InvalidPacketId> {
         if self.packets.remove(&id).is_some() {
             Ok(())
         } else {
@@ -293,12 +465,12 @@ impl ReceivePacketBuffer {
         }
     }
 
-    pub fn stats(&self, id: Uuid) -> PacketInStats {
+    fn stats(&self, id: PacketId) -> PacketInStats {
         todo!()
     }
 
     /// Forget packets that did not receive anything in a long time.
-    pub fn timeout_packets(&mut self, timeout: Duration) {
+    fn timeout_packets(&mut self, timeout: Duration) {
         self.packets
             .retain(|_, packet| packet.last_receive.elapsed() < timeout);
     }
@@ -329,9 +501,9 @@ pub enum ReceivedPacketAck<'a> {
 }
 
 #[derive(Debug, Error)]
-#[error("invalid packet id: {id}")]
+#[error("invalid {id:?}")]
 pub struct InvalidPacketId {
-    pub id: Uuid,
+    pub id: PacketId,
 }
 
 #[derive(Debug, Error)]
@@ -347,9 +519,9 @@ pub enum HandleReceivedPacketError {
 }
 
 #[derive(Debug, Error)]
-#[error("{kind} (id: {id})")]
+#[error("{id:?} {kind}")]
 pub struct PacketReceiveError {
-    pub id: Uuid,
+    pub id: PacketId,
     pub kind: PacketReceiveErrorKind,
 }
 
@@ -370,7 +542,7 @@ pub enum PacketReceiveErrorKind {
     Io(#[from] io::Error),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct PacketIn {
     last_receive: Instant,
     packet: Option<ReassembledPacket>,
@@ -378,8 +550,6 @@ struct PacketIn {
 
 trait SendPacket: Fn(&[u8]) -> io::Result<usize> {}
 impl<T: Fn(&[u8]) -> io::Result<usize>> SendPacket for T {}
-
-type PacketKindInt = u8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
@@ -404,10 +574,8 @@ enum PacketKind {
     /// If this packet gets dropped, the receiver would keep the uuid around indefinitely. For this
     /// reason, the receiver also forgets uuids after a sufficiently long timeout.
     Done,
-    /// Not a packet kind, but instead marks the start of the first user packet.
-    ///
-    /// These are unreliable and self-contained.
-    FirstUnreliable,
+    /// Not a packet kind, but instead marks the start of the first [`UpdatePacket`].
+    FirstUpdate,
 }
 
 /// Can store a single sequence index.
@@ -434,7 +602,7 @@ impl SeqKind {
     /// The number of bits used to store a single sequence index.
     ///
     /// The total count must be stored as a max index to fit!
-    fn bits(self) -> usize {
+    const fn bits(self) -> usize {
         self as usize
     }
 
@@ -456,11 +624,11 @@ impl SeqKind {
 
     /// How big a the data section of a chunk with this kind of sequence index is.
     const fn chunk_size(self) -> usize {
-        PACKET_DATA_SIZE - size_of::<Uuid>() - self.bits() / 4
+        PACKET_DATA_SIZE - size_of::<PacketId>() - self.bits() / 4
     }
 }
 
-fn ack(id: Uuid, seq_index: u32, send: impl SendPacket) -> Result<(), PacketReceiveError> {
+fn ack(id: PacketId, seq_index: u32, send: impl SendPacket) -> Result<(), PacketReceiveError> {
     let mut ack = [0; 17 + size_of::<SeqIndex>()];
     ack[0] = PacketKind::Ack as u8;
     ack[1..17].copy_from_slice(id.as_bytes());

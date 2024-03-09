@@ -6,21 +6,24 @@ use std::{
 };
 
 use bitvec::vec::BitVec;
-use uuid::Uuid;
+use rkyv::AlignedVec;
 
 use super::{
-    BatchSize, NonZeroBatchSize, PacketKind, PacketSendErrorKind, SendPacket, SentPacketAck,
-    SeqIndex, SeqIndexOutOfRange, SeqIndices, SeqKind, PACKET_BUFFER_SIZE,
+    BatchSize, NonZeroBatchSize, PacketId, PacketKind, PacketSendErrorKind, SendPacket,
+    SentPacketAck, SeqIndex, SeqIndexOutOfRange, SeqIndices, SeqKind, PACKET_BUFFER_SIZE,
 };
 
 /// Stores packets of any size so that they can be sent reliably.
 ///
 /// Packets are automatically split into chunks.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct PacketOut {
     /// The entire payload of the packet.
-    payload: Vec<u8>,
+    payload: AlignedVec,
     /// Which chunks have been acked so far.
+    ///
+    /// TODO: This is really slow for big packets, since it goes over everything repeatedly.
+    /// Instead, store the unacked packets as a list of ranges.
     acked_chunks: BitVec,
     /// The total number of chunks that have been acked.
     ///
@@ -46,21 +49,21 @@ impl PacketOut {
     /// - `send`: The function to send the packet; e.g. [`std::net::UdpSocket::send`].
     /// - `max_packets`: The maximum number of packets that are sent by this call.
     pub(crate) fn send(
-        id: Uuid,
-        payload: Vec<u8>,
+        id: PacketId,
+        payload: AlignedVec,
         send: impl SendPacket,
         initial_batch_size: NonZeroBatchSize,
     ) -> io::Result<Self> {
         assert!(!payload.is_empty());
 
-        let id = Uuid::new_v4();
         let (chunk_size, chunks) = Self::chunks(&payload);
+        let chunk_count = chunks.len();
         let last_batch_size =
             Self::send_chunks(id, chunk_size, chunks, |_| true, send, initial_batch_size)?;
         let now = Instant::now();
         Ok(Self {
             payload,
-            acked_chunks: BitVec::repeat(false, chunks.len()),
+            acked_chunks: BitVec::repeat(false, chunk_count),
             acks: 0,
             last_send: now,
             awaiting_ack_since: now,
@@ -75,6 +78,7 @@ impl PacketOut {
         &mut self,
         seq_index: SeqIndex,
     ) -> Result<SentPacketAck, PacketSendErrorKind> {
+        let seq_max = self.acked_chunks.len() - 1;
         if let Some(mut state) = self
             .acked_chunks
             .get_mut(usize::try_from(seq_index).unwrap())
@@ -83,7 +87,7 @@ impl PacketOut {
                 Ok(SentPacketAck::Pending { duplicate: true })
             } else {
                 self.last_batch_acks = self.last_batch_acks.saturating_add(1);
-                if usize::try_from(self.acks).unwrap() == self.acked_chunks.len() - 1 {
+                if usize::try_from(self.acks).unwrap() == seq_max {
                     // if all chunks were sent immediately, send_pending was never called to balance
                     self.batch_size = Self::balance_batch_size(
                         self.batch_size,
@@ -98,7 +102,7 @@ impl PacketOut {
                 }
             }
         } else {
-            let seq_max = SeqIndex::try_from(self.acked_chunks.len() - 1).unwrap();
+            let seq_max = SeqIndex::try_from(seq_max).unwrap();
             Err(SeqIndexOutOfRange { seq_index, seq_max })?
         }
     }
@@ -112,7 +116,7 @@ impl PacketOut {
     /// Returns the number of bytes in the payload that are sent every second.
     pub(crate) fn send_pending(
         &mut self,
-        id: Uuid,
+        id: PacketId,
         send: impl SendPacket,
         resend_delay: Duration,
     ) -> io::Result<()> {
@@ -235,7 +239,7 @@ impl PacketOut {
     /// - `send`: The function to send the packet; e.g. [`std::net::UdpSocket::send`].
     /// - `max_packets`: The maximum number of packets that are sent by this call.
     fn send_chunks<'a>(
-        id: Uuid,
+        id: PacketId,
         chunk_size: SeqKind,
         chunks: impl ExactSizeIterator<Item = &'a [u8]>,
         send_if: impl Fn(SeqIndex) -> bool,
@@ -249,7 +253,7 @@ impl PacketOut {
 
         let kind_pos = 0;
         let uuid_pos = kind_pos + size_of::<PacketKind>();
-        let seq_pos = uuid_pos + size_of::<Uuid>(); // contains index and max index
+        let seq_pos = uuid_pos + size_of::<PacketId>(); // contains index and max index
         let data_pos = seq_pos + seq_len;
 
         let mut sent_packets = NonZeroBatchSize::MIN;
@@ -258,8 +262,6 @@ impl PacketOut {
         buffer[uuid_pos..seq_pos].copy_from_slice(id.as_bytes());
         let mut seq_index: SeqIndex = 0;
         for chunk in chunks {
-            // TODO: This is really slow for big packets, since it goes over everything repeatedly.
-            // Instead, store the unacked packets as a list of ranges.
             if !send_if(seq_index) {
                 seq_index += 1;
                 continue;

@@ -1,64 +1,64 @@
-use std::time::Instant;
+// use std::time::Instant;
 
-use bevy::{log::LogPlugin, prelude::*};
-use packet_test::{handle_client_packets, ping_clients, timeout_clients, Server, ServerEntity};
-use uuid::Uuid;
+// use bevy::{log::LogPlugin, prelude::*};
+// use packet_test::{handle_client_packets, ping_clients, timeout_clients, Server, ServerEntity};
+// use uuid::Uuid;
 
 fn main() {
-    App::new()
-        .add_plugins((MinimalPlugins, LogPlugin::default()))
-        .add_systems(Startup, (setup, setup_server))
-        .add_systems(
-            Update,
-            (handle_client_packets, timeout_clients, ping_clients)
-                .run_if(resource_exists::<Server>),
-        )
-        .run();
+    // App::new()
+    //     .add_plugins((MinimalPlugins, LogPlugin::default()))
+    //     .add_systems(Startup, (setup, setup_server))
+    //     .add_systems(
+    //         Update,
+    //         (handle_client_packets, timeout_clients, ping_clients)
+    //             .run_if(resource_exists::<Server>),
+    //     )
+    //     .run();
 }
 
-type Version = u64;
+// type Version = u64;
 
-enum ClientState {
-    /// The entity is not loaded.
-    Unloaded,
-    /// The entity is loaded.
-    Loaded {
-        /// When the client acknowledged this version.
-        at: Instant,
-        /// The version that the client has currently loaded.
-        version: Version,
-    },
-}
+// enum ClientState {
+//     /// The entity is not loaded.
+//     Unloaded,
+//     /// The entity is loaded.
+//     Loaded {
+//         /// When the client acknowledged this version.
+//         at: Instant,
+//         /// The version that the client has currently loaded.
+//         version: Version,
+//     },
+// }
 
-enum ClientStateTransition {
-    Load,
-    Unload,
-}
+// enum ClientStateTransition {
+//     Load,
+//     Unload,
+// }
 
-struct ClientEntity {
-    current: ClientState,
-    transition: Option<ClientStateTransition>,
-}
+// struct ClientEntity {
+//     current: ClientState,
+//     transition: Option<ClientStateTransition>,
+// }
 
 // /// Contains a list of [`ClientEntity`]s that describes the client.
 // struct ServerEntity {
 //     clients: Vec<Option<ClientEntity>>,
 // }
 
-fn setup_server(mut commands: Commands) {
-    match Server::new() {
-        Ok(server) => {
-            commands.insert_resource(server);
-        }
-        Err(error) => {
-            error!("{error}");
-        }
-    }
-}
+// fn setup_server(mut commands: Commands) {
+//     match Server::new() {
+//         Ok(server) => {
+//             commands.insert_resource(server);
+//         }
+//         Err(error) => {
+//             error!("{error}");
+//         }
+//     }
+// }
 
-fn setup(mut commands: Commands) {
-    commands.spawn((SpatialBundle::default(), ServerEntity(Uuid::new_v4())));
-}
+// fn setup(mut commands: Commands) {
+//     commands.spawn((SpatialBundle::default(), ServerEntity(Uuid::new_v4())));
+// }
 
 // struct PacketPayload {
 //     id: u16,
