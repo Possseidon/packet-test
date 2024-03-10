@@ -1,79 +1,126 @@
 use std::{
+    convert::Infallible,
     sync::mpsc::{sync_channel, Receiver, SyncSender},
-    thread::{self, JoinHandle},
+    thread,
 };
 
-use rkyv::{ser::Serializer, Fallible, Infallible};
+use rkyv::{ser::Serializer, Fallible};
 
-use super::{send::PacketBuffer, Packet, PacketId, PacketKind, SeqIndex, PACKET_BUFFER_SIZE};
+use super::{send::PacketBuffer, Packet, PacketId};
 
-/// Spawns a thread that serializes the given
-pub(crate) fn spawn_serialize_packet<T: Packet>(
+/// Serializes the packet, automatically switching to a thread if necessary.
+///
+/// 1. Serializes up to `max_direct` packets into a [`Vec`].
+/// 2. If more packets are required, spawns a detached thread and returns a channel.
+///
+/// The thread uses a rendezvous channel, so it only prepares a single packet without buffering
+/// additional packets in advance. If the receiver is dropped, the thread will skip through the
+/// remaining write calls and should finish relatively quickly.
+pub(crate) fn serialize_packet<T: Packet>(
     id: PacketId,
+    max_direct: usize,
     value: T,
-) -> (Receiver<PacketBuffer>, JoinHandle<()>) {
+) -> SerializedPacket {
+    let mut serializer = VecPacketSerializer {
+        max_packets: max_direct,
+        buffer: vec![PacketBuffer::new(id)],
+    };
+    if serializer.serialize_value(&value).is_ok() {
+        return SerializedPacket::Vec(serializer.buffer);
+    }
+
     let (tx, rx) = sync_channel(0);
-    (
-        rx,
-        thread::spawn(move || {
-            ChannelSerializer {
-                id,
-                seq_index: 0,
-                buffer: PacketBuffer::default(),
-                tx,
-            }
-            .serialize_value(&value)
-            .unwrap();
-        }),
-    )
+    thread::spawn(move || {
+        ChannelPacketSerializer {
+            buffer: PacketBuffer::new(id),
+            tx: Some(tx),
+        }
+        .serialize_value(&value)
+        .expect("should be infallible");
+    });
+    SerializedPacket::Channel(rx)
 }
 
-pub(crate) struct ChannelSerializer {
-    id: PacketId,
-    seq_index: SeqIndex,
-    buffer: PacketBuffer,
-    tx: SyncSender<PacketBuffer>,
+pub(crate) enum SerializedPacket {
+    Vec(Vec<PacketBuffer>),
+    Channel(Receiver<PacketBuffer>),
 }
 
-impl Fallible for ChannelSerializer {
-    type Error = Infallible;
+#[derive(Default)]
+pub struct VecPacketSerializer {
+    max_packets: usize,
+    buffer: Vec<PacketBuffer>,
 }
 
-impl Serializer for ChannelSerializer {
+impl Fallible for VecPacketSerializer {
+    type Error = ();
+}
+
+impl Serializer for VecPacketSerializer {
     fn pos(&self) -> usize {
-        // TODO: This might need to return the proper value, note sure
         0
     }
 
     fn write(&mut self, mut bytes: &[u8]) -> Result<(), Self::Error> {
         while !bytes.is_empty() {
-            if self.buffer.is_empty() {
-                self.buffer.append(&[PacketKind::Part.into()]);
-                self.buffer.append(self.id.as_bytes());
-                self.buffer.append(&self.seq_index.to_le_bytes());
-                // seq_index won't be used after wrapping
-                self.seq_index = self.seq_index.wrapping_add(1);
-            }
-
-            let end = (self.buffer.len() + bytes.len()).min(PACKET_BUFFER_SIZE);
-            let count = end - self.buffer.len();
-            self.buffer.append(&bytes[..count]);
-
-            bytes = &bytes[count..];
-
-            if self.buffer.len() == PACKET_BUFFER_SIZE {
-                self.tx.send(self.buffer.clone()).unwrap();
-                self.buffer.clear();
+            let at_limit = self.buffer.len() == self.max_packets;
+            let last = self.buffer.last_mut().expect("should not be empty");
+            let before = bytes.len();
+            bytes = last.append(bytes);
+            let after = bytes.len();
+            if after == before {
+                if at_limit {
+                    return Err(());
+                }
+                let packet = last.new_next();
+                self.buffer.push(packet);
             }
         }
         Ok(())
     }
 }
 
-impl Drop for ChannelSerializer {
+pub struct ChannelPacketSerializer {
+    buffer: PacketBuffer,
+    tx: Option<SyncSender<PacketBuffer>>,
+}
+
+impl Fallible for ChannelPacketSerializer {
+    type Error = Infallible;
+}
+
+impl Serializer for ChannelPacketSerializer {
+    fn pos(&self) -> usize {
+        0
+    }
+
+    fn write(&mut self, mut bytes: &[u8]) -> Result<(), Self::Error> {
+        let Some(tx) = &self.tx else {
+            // just skip through everything if the channel is closed
+            return Ok(());
+        };
+        while !bytes.is_empty() {
+            let before = bytes.len();
+            bytes = self.buffer.append(bytes);
+            let after = bytes.len();
+            if after == before {
+                if tx.send(self.buffer.copy()).is_err() {
+                    self.tx = None;
+                    return Ok(());
+                }
+                self.buffer.next();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ChannelPacketSerializer {
     fn drop(&mut self) {
-        if !self.buffer.is_empty() {
-            self.tx.send(self.buffer.clone()).unwrap();
+        if let Some(tx) = &self.tx {
+            assert!(!self.buffer.is_empty());
+            self.buffer.mark_last();
+            tx.send(self.buffer.copy()).unwrap();
         }
     }
 }

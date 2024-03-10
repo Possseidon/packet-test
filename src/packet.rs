@@ -12,14 +12,14 @@ use std::{
 };
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use rkyv::{ser::serializers::BufferSerializer, AlignedBytes, Archive, Serialize};
+use rkyv::{Archive, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use self::{
     receive::{ReassembledPacket, ReceivedPacketAck},
-    send::{PacketOut, PacketQueue},
-    serialize::ChannelSerializer,
+    send::PacketOut,
+    serialize::{serialize_packet, ChannelPacketSerializer, VecPacketSerializer},
 };
 
 /// The maximum size of a packet.
@@ -55,19 +55,12 @@ impl Packets for DefaultPackets {
 }
 
 pub trait Packet:
-    Serialize<BufferSerializer<[AlignedBytes<PACKET_BUFFER_SIZE>; 15]>>
-    + Serialize<ChannelSerializer>
-    + Send
-    + 'static
+    Serialize<VecPacketSerializer> + Serialize<ChannelPacketSerializer> + Send + 'static
 {
 }
 
-impl<
-        T: Serialize<BufferSerializer<[AlignedBytes<PACKET_BUFFER_SIZE>; 15]>>
-            + Serialize<ChannelSerializer>
-            + Send
-            + 'static,
-    > Packet for T
+impl<T: Serialize<VecPacketSerializer> + Serialize<ChannelPacketSerializer> + Send + 'static> Packet
+    for T
 {
 }
 
@@ -162,7 +155,7 @@ pub struct PacketBuffers<S: Packet, R: Packet> {
 }
 
 impl<S: Packet, R: Packet> PacketBuffers<S, R> {
-    pub fn new(initial_send_batch_size: NonZeroBatchSize) -> Self {
+    fn new(initial_send_batch_size: NonZeroBatchSize) -> Self {
         Self {
             send_buffer: SendPacketBuffer::new(initial_send_batch_size),
             receive_buffer: Default::default(),
@@ -170,8 +163,8 @@ impl<S: Packet, R: Packet> PacketBuffers<S, R> {
         }
     }
 
-    pub fn send(&mut self, packet: &S, send: impl SendPacket) -> io::Result<PacketId> {
-        todo!()
+    fn send(&mut self, packet: S, send: impl SendPacket) -> io::Result<PacketId> {
+        self.send_buffer.send(packet, send)
     }
 }
 
@@ -220,14 +213,12 @@ impl SendPacketBuffer {
     }
 
     /// Sends a new packet and returns its id for tracking purposes.
-    fn send(
-        &mut self,
-        packet_queue: impl Into<PacketQueue>,
-        send: impl SendPacket,
-    ) -> io::Result<PacketId> {
+    fn send(&mut self, packet: impl Packet, send: impl SendPacket) -> io::Result<PacketId> {
         let id = PacketId::new();
+        // TODO: Try a normal serializer first and fallback to the threaded one
+        let packet = serialize_packet(id, 4, packet);
         self.packets
-            .insert(id, PacketOut::send(packet_queue, send, self.batch_size)?);
+            .insert(id, PacketOut::send(packet, send, self.batch_size)?);
         Ok(id)
     }
 
@@ -462,7 +453,7 @@ pub struct PacketInStats {
     pub received_bytes: NonZeroUsize,
 }
 
-pub enum ReceivedPacketHandling<'a> {
+enum ReceivedPacketHandling<'a> {
     /// This packet should be handled by someone else.
     Unhandled,
     /// This packet was received and acked.

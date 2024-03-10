@@ -5,12 +5,11 @@ use std::{
 
 use crate::packet::{PacketBuffers, Packets};
 
-// TODO: Make ServerPacket and ClientPacket generic
 pub struct Client<P: Packets> {
     socket: UdpSocket,
-    /// The last time the server sent a ping.
-    ping: Instant,
-    /// How long the client waits for a ping from the server before it disconnects.
+    /// The last time the server sent a packet.
+    last_packet: Instant,
+    /// How long the client waits for a packet from the server before it disconnects.
     timeout: Duration,
     buffers: PacketBuffers<P::Client, P::Server>,
 }

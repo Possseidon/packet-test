@@ -2,8 +2,8 @@ use std::{
     collections::VecDeque,
     io,
     iter::zip,
-    mem::replace,
-    ops::Deref,
+    mem::{replace, size_of},
+    ops::{Deref, DerefMut},
     sync::mpsc::Receiver,
     time::{Duration, Instant},
 };
@@ -11,8 +11,8 @@ use std::{
 use rkyv::AlignedBytes;
 
 use super::{
-    BatchSize, BufferIndex, NonZeroBatchSize, PacketId, PacketKind, SendPacket, SeqIndex,
-    SeqIndexAckedBeforeSent, PACKET_BUFFER_SIZE,
+    serialize::SerializedPacket, BatchSize, BufferIndex, NonZeroBatchSize, PacketId, PacketKind,
+    SendPacket, SeqIndex, SeqIndexAckedBeforeSent, PACKET_BUFFER_SIZE,
 };
 
 /// Stores packets of any size so that they can be sent reliably.
@@ -36,17 +36,17 @@ pub(crate) struct PacketOut {
 
 impl PacketOut {
     pub(crate) fn send(
-        packet_queue: impl Into<PacketQueue>,
+        packet: SerializedPacket,
         send: impl SendPacket,
         initial_batch_size: NonZeroBatchSize,
     ) -> io::Result<Self> {
-        let mut packet_queue = packet_queue.into();
+        let mut packet_queue = PacketQueue::new(packet);
         let last_batch_size =
             NonZeroBatchSize::new(packet_queue.send_unacked(initial_batch_size, send)?)
                 .expect("packet should not be empty");
         let now = Instant::now();
         Ok(Self {
-            packet_queue: packet_queue.into(),
+            packet_queue,
             last_send: now,
             awaiting_ack_since: now,
             batch_size: initial_batch_size,
@@ -125,7 +125,7 @@ impl PacketOut {
     /// this is intended to be used for measuring throughput, it should not matter all that much.
     fn last_batch_bytes(&self) -> usize {
         // TODO: improve estimation, PACKET_BUFFER_SIZE is too large
-        usize::try_from(self.last_batch_size.get()).unwrap() * PACKET_BUFFER_SIZE
+        usize::from(self.last_batch_size.get()) * PACKET_BUFFER_SIZE
     }
 
     /// Adjusts the batch size based on the number of acked chunks.
@@ -159,7 +159,7 @@ impl PacketOut {
 }
 
 #[derive(Debug)]
-pub(crate) struct PacketQueue {
+struct PacketQueue {
     /// A buffer with packets that have not yet been acked.
     ///
     /// Any front packets that are acked can be removed while incrementing [`Self::first_unacked`].
@@ -173,6 +173,21 @@ pub(crate) struct PacketQueue {
 }
 
 impl PacketQueue {
+    fn new(packet: SerializedPacket) -> Self {
+        match packet {
+            SerializedPacket::Vec(packets) => Self {
+                packets: packets.into(),
+                first_unacked: 0,
+                rx: None,
+            },
+            SerializedPacket::Channel(rx) => Self {
+                packets: Default::default(),
+                first_unacked: 0,
+                rx: Some(rx),
+            },
+        }
+    }
+
     /// Sends up to `batch_size` packets and returns the number of packets that were actually sent.
     fn send_unacked(
         &mut self,
@@ -227,60 +242,74 @@ impl PacketQueue {
     }
 }
 
-impl From<VecDeque<PacketBuffer>> for PacketQueue {
-    fn from(packets: VecDeque<PacketBuffer>) -> Self {
-        Self {
-            packets,
-            first_unacked: 0,
-            rx: None,
-        }
-    }
-}
-
-impl From<Receiver<PacketBuffer>> for PacketQueue {
-    fn from(rx: Receiver<PacketBuffer>) -> Self {
-        Self {
-            packets: Default::default(),
-            first_unacked: 0,
-            rx: Some(rx),
-        }
-    }
-}
-
-#[derive(Default)]
 pub(crate) struct PacketBuffer {
     acked: bool,
     len: BufferIndex,
     data: AlignedBytes<PACKET_BUFFER_SIZE>,
 }
+
 impl PacketBuffer {
-    pub(crate) fn clear(&mut self) {
-        self.len = 0;
-    }
-
-    pub(crate) fn append(&mut self, data: &[u8]) {
-        let end = self.len();
-        let new_end = end + data.len();
-        self.data[end..new_end].copy_from_slice(data);
-        self.len = BufferIndex::try_from(new_end).unwrap();
-    }
-}
-
-impl Clone for PacketBuffer {
-    fn clone(&self) -> Self {
+    pub(crate) fn new(id: PacketId) -> Self {
         let mut result = Self {
-            acked: self.acked,
-            len: self.len,
-            data: AlignedBytes::default(),
+            acked: false,
+            len: 0,
+            data: Default::default(),
         };
-        result.data[..self.len.into()].copy_from_slice(self);
+        result.append(&[PacketKind::Part.into()]);
+        result.append(id.as_bytes());
+        result.append(&(0 as SeqIndex).to_le_bytes());
+        result.len = BufferIndex::try_from(
+            size_of::<PacketKind>() + size_of::<PacketId>() + size_of::<SeqIndex>(),
+        )
+        .unwrap();
         result
     }
 
-    fn clone_from(&mut self, source: &Self) {
-        self.acked = source.acked;
-        self.len = source.len;
-        self.data[..source.len.into()].copy_from_slice(source);
+    pub(crate) fn copy(&self) -> Self {
+        let mut result = Self {
+            acked: false,
+            len: self.len,
+            data: Default::default(),
+        };
+        let len = usize::from(self.len);
+        result.data[..len].copy_from_slice(&self.data[..len]);
+        result
+    }
+
+    pub(crate) fn next(&mut self) {
+        assert_eq!(usize::from(self.len), PACKET_BUFFER_SIZE);
+        let start = size_of::<PacketKind>() + size_of::<PacketId>();
+        self.len = BufferIndex::try_from(start + size_of::<SeqIndex>()).unwrap();
+        let range = start..usize::from(self.len);
+        let next_seq_index =
+            SeqIndex::from_le_bytes(self.data[range.clone()].try_into().unwrap()) + 1;
+        self.data[range].copy_from_slice(&SeqIndex::to_le_bytes(next_seq_index));
+    }
+
+    pub(crate) fn mark_last(&mut self) {
+        self.data[0] = PacketKind::LastPart.into();
+    }
+
+    pub(crate) fn append<'a>(&mut self, data: &'a [u8]) -> &'a [u8] {
+        let space = PACKET_BUFFER_SIZE - self.len();
+        let len = data.len().min(space);
+        let end = self.len();
+        let new_end = end + len;
+        self.data[end..new_end].copy_from_slice(&data[..len]);
+        self.len = BufferIndex::try_from(new_end).unwrap();
+        &data[len..]
+    }
+
+    pub(crate) fn new_next(&self) -> Self {
+        let header_len = size_of::<PacketKind>() + size_of::<PacketId>() + size_of::<SeqIndex>();
+        let mut result = Self {
+            acked: false,
+            len: BufferIndex::try_from(header_len).unwrap(),
+            data: Default::default(),
+        };
+        result.data[..header_len].copy_from_slice(&self.data[..header_len]);
+        result.next();
+        result
     }
 }
 
@@ -301,6 +330,12 @@ impl Deref for PacketBuffer {
     }
 }
 
+impl DerefMut for PacketBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data[0..self.len.into()]
+    }
+}
+
 impl<T> AsRef<T> for PacketBuffer
 where
     T: ?Sized,
@@ -308,6 +343,15 @@ where
 {
     fn as_ref(&self) -> &T {
         self.deref().as_ref()
+    }
+}
+
+impl<T> AsMut<T> for PacketBuffer
+where
+    <PacketBuffer as Deref>::Target: AsMut<T>,
+{
+    fn as_mut(&mut self) -> &mut T {
+        self.deref_mut().as_mut()
     }
 }
 

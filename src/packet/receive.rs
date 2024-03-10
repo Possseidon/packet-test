@@ -1,7 +1,7 @@
 use bitvec::vec::BitVec;
 use rkyv::AlignedVec;
 
-use super::{PacketId, PacketReceiveErrorKind, SeqIndex, PART_PACKET_PAYLOAD_SIZE};
+use super::{SeqIndex, PART_PACKET_PAYLOAD_SIZE};
 
 /// Reassembles received packets.
 #[derive(Clone, Debug, Default)]
