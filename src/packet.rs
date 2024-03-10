@@ -30,14 +30,11 @@ pub type NonZeroBufferIndex = NonZeroU16;
 pub type BufferIndex = u16;
 
 /// Various packet types that are used by server and client to communicate with each other.
-///
-/// While it is technically possible to use the same packet type for both server and client, I
-/// generally recommend against it.
 pub trait Packets {
     /// Packets sent by the server.
-    type Server: ConnectionPacket<ServerConnectionPacket>;
+    type Server: Packet;
     /// Packets sent by the client.
-    type Client: ConnectionPacket<ClientConnectionPacket>;
+    type Client: Packet;
 
     /// Update packets sent by the server.
     type ServerUpdate: UpdatePacket;
@@ -49,8 +46,8 @@ pub trait Packets {
 struct DefaultPackets;
 
 impl Packets for DefaultPackets {
-    type Server = ServerConnectionPacket;
-    type Client = ClientConnectionPacket;
+    type Server = ();
+    type Client = ();
 
     type ServerUpdate = NoUpdate;
     type ClientUpdate = NoUpdate;
@@ -59,36 +56,46 @@ impl Packets for DefaultPackets {
 pub trait Packet: Serialize<AlignedSerializer<AlignedVec>> {}
 impl<T: Serialize<AlignedSerializer<AlignedVec>>> Packet for T {}
 
-/// Packets that can also be checked for server/client connection information.
-pub trait ConnectionPacket<T: Packet>: Packet {
-    fn connection_packet(&self) -> Option<T>;
-}
-
 /// Server packets for dealing with client connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize)]
-pub enum ServerConnectionPacket {
+pub enum ServerConnectionPacket<T> {
     Accept,
     Reject,
     Kick,
-}
-
-impl ConnectionPacket<ServerConnectionPacket> for ServerConnectionPacket {
-    fn connection_packet(&self) -> Option<ServerConnectionPacket> {
-        Some(*self)
-    }
+    User(T),
 }
 
 /// Client packets for establishing a server connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize)]
-pub enum ClientConnectionPacket {
+pub enum ClientConnectionPacket<T> {
     Connect,
     Disconnect,
+    User(T),
 }
 
-impl ConnectionPacket<ClientConnectionPacket> for ClientConnectionPacket {
-    fn connection_packet(&self) -> Option<ClientConnectionPacket> {
-        Some(*self)
-    }
+/// Packets for things that constantly change, which means it's okay if some are dropped.
+///
+/// These packets must fit into a single datagram.
+#[allow(clippy::len_without_is_empty)] // len is always > 0
+pub trait UpdatePacket: Sized {
+    type ReadError: std::error::Error;
+
+    /// Lower bound for the size of the packet.
+    ///
+    /// Used as an upfront check to see if the packet might fit in the remaining buffer.
+    ///
+    /// Must be at most [`PACKET_BUFFER_SIZE`].
+    fn len(&self) -> NonZeroBufferIndex;
+
+    /// Writes [`UpdatePacket::len()`] bytes to the given buffer.
+    ///
+    /// The first byte must be at least [`PacketKind::FirstUpdate`].
+    fn write(&self, buf: &mut [u8]);
+
+    /// Tries to read a packet from the given buffer.
+    ///
+    /// The returned value can be used to get the number of read bytes via [`UpdatePacket::len()`].
+    fn read(buf: &[u8]) -> Result<Self, Self::ReadError>;
 }
 
 pub enum NoUpdate {}
@@ -100,42 +107,17 @@ pub struct NoUpdateError;
 impl UpdatePacket for NoUpdate {
     type ReadError = NoUpdateError;
 
-    fn write(&self, _buf: &mut [u8]) -> Option<NonZeroUsize> {
+    fn len(&self) -> NonZeroBufferIndex {
         unreachable!()
     }
 
-    fn read(_buf: &[u8]) -> Result<(usize, Self), Self::ReadError> {
+    fn write(&self, _buf: &mut [u8]) {
+        unreachable!()
+    }
+
+    fn read(_buf: &[u8]) -> Result<Self, Self::ReadError> {
         Err(NoUpdateError)
     }
-}
-
-/// Packets for things that constantly change, which means it's okay if some are dropped.
-///
-/// These packets must fit into a single datagram.
-pub trait UpdatePacket: Sized {
-    type ReadError: std::error::Error;
-
-    /// Lower bound for the size of the packet.
-    ///
-    /// Used as an upfront check to see if the packet might fit in the remaining buffer.
-    ///
-    /// Must be at most [`PACKET_BUFFER_SIZE`].
-    fn min_size(&self) -> NonZeroBufferIndex {
-        NonZeroBufferIndex::MIN
-    }
-
-    /// Writes the packet to the given buffer and returns the number of bytes written.
-    ///
-    /// The first byte must be at least [`PacketKind::FirstUpdate`]s.
-    ///
-    /// Returns [`None`] if there isn't enough space, but must not return [`None`] if `buf` is
-    /// [`PACKET_BUFFER_SIZE`] bytes long.
-    fn write(&self, buf: &mut [u8]) -> Option<NonZeroUsize>;
-
-    /// Reads a packet from the given buffer.
-    ///
-    /// Returns the number of bytes that were read from `buf`.
-    fn read(buf: &[u8]) -> Result<(usize, Self), Self::ReadError>;
 }
 
 pub type NonZeroBatchSize = NonZeroU16;
