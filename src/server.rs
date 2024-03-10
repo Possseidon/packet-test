@@ -210,19 +210,6 @@ struct Connection<P: Packets> {
     // updates: UpdateTracker,
 }
 
-impl<P: Packets> Clone for Connection<P> {
-    fn clone(&self) -> Self {
-        Self {
-            addr: self.addr.clone(),
-            ping_id: self.ping_id.clone(),
-            ping: self.ping.clone(),
-            pong: self.pong.clone(),
-            batch_size: self.batch_size.clone(),
-            buffers: self.buffers.clone(),
-        }
-    }
-}
-
 impl<P: Packets> std::fmt::Debug for Connection<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection")

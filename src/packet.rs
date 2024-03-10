@@ -1,25 +1,26 @@
 mod receive;
 mod send;
+mod serialize;
 
 use std::{
     collections::{btree_map::Entry, BTreeMap},
-    convert::Infallible,
     io,
     marker::PhantomData,
     mem::size_of,
-    num::{NonZeroU16, NonZeroU8, NonZeroUsize},
+    num::{NonZeroU16, NonZeroUsize},
     time::{Duration, Instant},
 };
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use rkyv::{
-    ser::{serializers::AlignedSerializer, Serializer},
-    AlignedVec, Archive, Serialize,
-};
+use rkyv::{ser::serializers::BufferSerializer, AlignedBytes, Archive, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use self::{receive::ReassembledPacket, send::PacketOut};
+use self::{
+    receive::{ReassembledPacket, ReceivedPacketAck},
+    send::{PacketOut, PacketQueue},
+    serialize::ChannelSerializer,
+};
 
 /// The maximum size of a packet.
 pub const PACKET_BUFFER_SIZE: usize = 512;
@@ -53,8 +54,22 @@ impl Packets for DefaultPackets {
     type ClientUpdate = NoUpdate;
 }
 
-pub trait Packet: Serialize<AlignedSerializer<AlignedVec>> {}
-impl<T: Serialize<AlignedSerializer<AlignedVec>>> Packet for T {}
+pub trait Packet:
+    Serialize<BufferSerializer<[AlignedBytes<PACKET_BUFFER_SIZE>; 15]>>
+    + Serialize<ChannelSerializer>
+    + Send
+    + 'static
+{
+}
+
+impl<
+        T: Serialize<BufferSerializer<[AlignedBytes<PACKET_BUFFER_SIZE>; 15]>>
+            + Serialize<ChannelSerializer>
+            + Send
+            + 'static,
+    > Packet for T
+{
+}
 
 /// Server packets for dealing with client connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize)]
@@ -156,19 +171,7 @@ impl<S: Packet, R: Packet> PacketBuffers<S, R> {
     }
 
     pub fn send(&mut self, packet: &S, send: impl SendPacket) -> io::Result<PacketId> {
-        let mut serializer = AlignedSerializer::default();
-        serializer.serialize_value(packet).unwrap();
-        self.send_buffer.send(serializer.into_inner(), send)
-    }
-}
-
-impl<S: Packet, R: Packet> Clone for PacketBuffers<S, R> {
-    fn clone(&self) -> Self {
-        Self {
-            send_buffer: self.send_buffer.clone(),
-            receive_buffer: self.receive_buffer.clone(),
-            _phantom: PhantomData,
-        }
+        todo!()
     }
 }
 
@@ -182,7 +185,7 @@ impl<S: Packet, R: Packet> std::fmt::Debug for PacketBuffers<S, R> {
 }
 
 /// Sent packets that are not yet fully acked.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct SendPacketBuffer {
     // TODO: Update batch_size somehow
     batch_size: NonZeroBatchSize,
@@ -208,27 +211,30 @@ impl SendPacketBuffer {
     ) -> Result<SentPacketHandling, PacketSendError> {
         todo!();
 
-        let id;
-        let seq_index;
-        Ok(SentPacketHandling::Ack(
-            self.ack(id, seq_index, send)
-                .map_err(|kind| PacketSendError { id, kind })?,
-        ))
+        // let id;
+        // let seq_index;
+        // Ok(SentPacketHandling::Ack(
+        //     self.ack(id, seq_index, send)
+        //         .map_err(|kind| PacketSendError { id, kind })?,
+        // ))
     }
 
     /// Sends a new packet and returns its id for tracking purposes.
-    fn send(&mut self, payload: AlignedVec, send: impl SendPacket) -> io::Result<PacketId> {
+    fn send(
+        &mut self,
+        packet_queue: impl Into<PacketQueue>,
+        send: impl SendPacket,
+    ) -> io::Result<PacketId> {
         let id = PacketId::new();
-        let packet = PacketOut::send(id, payload, send, self.batch_size)?;
-        self.packets.insert(id, packet);
+        self.packets
+            .insert(id, PacketOut::send(packet_queue, send, self.batch_size)?);
         Ok(id)
     }
 
     /// Sends out still pending packet parts.
     fn send_pending(&mut self, send: impl SendPacket, resend_delay: Duration) -> io::Result<()> {
-        todo!();
-        for (id, packet) in &self.packets {
-            packet.send_pending(*id, send, resend_delay)?;
+        for (id, packet) in &mut self.packets {
+            packet.send_pending(*id, &send, resend_delay)?;
         }
         Ok(())
     }
@@ -241,7 +247,7 @@ impl SendPacketBuffer {
     ) -> Result<PacketOutStats, InvalidPacketId> {
         let packet = self.packets.get(&id).ok_or(InvalidPacketId { id })?;
         Ok(PacketOutStats {
-            total_bytes: packet.total_bytes(),
+            // total_bytes: packet.total_bytes(),
             acked_bytes: packet.acked_bytes(),
             bytes_per_sec: packet.bytes_per_sec(resend_delay),
             batch_size: packet.batch_size(),
@@ -256,20 +262,12 @@ impl SendPacketBuffer {
         id: PacketId,
         seq_index: SeqIndex,
         send: impl SendPacket,
-    ) -> Result<SentPacketAck, PacketSendErrorKind> {
-        let packet = self
+    ) -> Result<bool, PacketSendErrorKind> {
+        Ok(self
             .packets
             .get_mut(&id)
-            .ok_or(PacketSendErrorKind::InvalidPacketId)?;
-        let ack = packet.ack(seq_index)?;
-        if let SentPacketAck::Done = ack {
-            let mut done = [0; 17];
-            done[0] = PacketKind::Done.into();
-            done[1..17].copy_from_slice(id.as_bytes());
-            send(&done)?;
-            self.packets.remove(&id);
-        }
-        Ok(ack)
+            .ok_or(PacketSendErrorKind::InvalidPacketId)?
+            .ack(seq_index)?)
     }
 
     /// Forget packets that did not receive acks in a long time.
@@ -305,12 +303,14 @@ pub enum PacketSendErrorKind {
     SeqIndexOutOfRange(#[from] SeqIndexOutOfRange),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    SeqIndexAckedBeforeSent(#[from] SeqIndexAckedBeforeSent),
 }
 
 /// Statistics about progress and throughput of a packet.
 pub struct PacketOutStats {
     /// The total size of the packet in bytes.
-    pub total_bytes: NonZeroUsize,
+    // pub total_bytes: NonZeroUsize,
     /// How many bytes of the packet were sent successfully (i.e. acked).
     pub acked_bytes: usize,
     /// Throughput of this packet measured in bytes per second.
@@ -348,55 +348,56 @@ impl ReceivePacketBuffer {
         buffer: &[u8],
         send: impl SendPacket,
     ) -> Result<ReceivedPacketHandling, HandleReceivedPacketError> {
-        let kind = buffer.get(0).expect("payload must not be empty");
-        if let Ok(kind) = PacketKind::try_from(*kind) {
-            if let PacketKind::Ack | PacketKind::FirstUpdate = kind {
-                return Ok(ReceivedPacketHandling::Unhandled);
-            }
+        todo!();
 
-            let id = PacketId::from_slice(
-                buffer
-                    .get(1..17)
-                    .ok_or(HandleReceivedPacketError::Malformed)?,
-            )
-            .unwrap();
+        // let kind = buffer.get(0).expect("payload must not be empty");
+        // if let Ok(kind) = PacketKind::try_from(*kind) {
+        //     if let PacketKind::Ack | PacketKind::FirstUpdate = kind {
+        //         return Ok(ReceivedPacketHandling::Unhandled);
+        //     }
 
-            if kind == PacketKind::Done {
-                self.done(id)?;
-                return Ok(ReceivedPacketHandling::Done);
-            }
-            let seq_kind = match kind {
-                PacketKind::SelfContained => SeqKind::None,
-                PacketKind::PartU4 => SeqKind::U4,
-                PacketKind::PartU8 => SeqKind::U8,
-                PacketKind::PartU16 => SeqKind::U16,
-                PacketKind::PartU32 => SeqKind::U32,
-                PacketKind::Ack | PacketKind::Done | PacketKind::FirstUpdate => unreachable!(),
-            };
+        //     let id = PacketId::from_slice(
+        //         buffer
+        //             .get(1..17)
+        //             .ok_or(HandleReceivedPacketError::Malformed)?,
+        //     )
+        //     .unwrap();
 
-            let seq_index;
-            let seq_max;
-            let payload = &buffer[todo!()..];
+        //     if kind == PacketKind::Done {
+        //         self.done(id)?;
+        //         return Ok(ReceivedPacketHandling::Done);
+        //     }
+        //     let seq_kind = match kind {
+        //         PacketKind::SelfContained => SeqKind::None,
+        //         PacketKind::PartU4 => SeqKind::U4,
+        //         PacketKind::PartU8 => SeqKind::U8,
+        //         PacketKind::PartU16 => SeqKind::U16,
+        //         PacketKind::PartU32 => SeqKind::U32,
+        //         PacketKind::Ack | PacketKind::Done | PacketKind::FirstUpdate => unreachable!(),
+        //     };
 
-            Ok(ReceivedPacketHandling::Received(self.receive(
-                id, seq_kind, seq_index, seq_max, payload, send,
-            )?))
-        } else {
-            Ok(ReceivedPacketHandling::Unhandled)
-        }
+        //     let seq_index;
+        //     let seq_max;
+        //     let payload = &buffer[todo!()..];
+
+        //     Ok(ReceivedPacketHandling::Received(self.receive(
+        //         id, seq_kind, seq_index, seq_max, payload, send,
+        //     )?))
+        // } else {
+        //     Ok(ReceivedPacketHandling::Unhandled)
+        // }
     }
 
     /// Reassembles the given packet and returns its state.
     fn receive<'a>(
         &'a mut self,
+        last: bool,
         id: PacketId,
-        seq_kind: SeqKind,
         seq_index: SeqIndex,
-        seq_max: SeqIndex,
         payload: &'a [u8],
         send: impl SendPacket,
     ) -> Result<ReceivedPacketAck<'a>, PacketReceiveError> {
-        if seq_max == 0 {
+        if last && seq_index == 0 {
             match self.packets.entry(id) {
                 Entry::Vacant(entry) => {
                     entry.insert(PacketIn {
@@ -421,12 +422,10 @@ impl ReceivePacketBuffer {
         } else {
             let packet = self.packets.entry(id).or_insert_with(|| PacketIn {
                 last_receive: Instant::now(),
-                packet: Some(ReassembledPacket::new(seq_kind, seq_max)),
+                packet: Some(ReassembledPacket::new()),
             });
             if let Some(packet) = &mut packet.packet {
-                let packet_ack = packet
-                    .receive(id, seq_kind, seq_index, payload)
-                    .map_err(|kind| PacketReceiveError { id, kind })?;
+                let packet_ack = packet.receive(last, seq_index, payload);
                 ack(id, seq_index, send)?;
                 Ok(packet_ack)
             } else {
@@ -472,16 +471,6 @@ pub enum ReceivedPacketHandling<'a> {
     Done,
 }
 
-pub enum ReceivedPacketAck<'a> {
-    /// A part of the packet was received and acked.
-    Pending {
-        /// Whether this packet was already received, which can happen when an ack gets dropped.
-        duplicate: bool,
-    },
-    /// The packet is fully assembled.
-    Done(&'a [u8]),
-}
-
 #[derive(Debug, Error)]
 #[error("invalid {id:?}")]
 pub struct InvalidPacketId {
@@ -515,6 +504,12 @@ pub struct SeqIndexOutOfRange {
 }
 
 #[derive(Debug, Error)]
+#[error("the packet sequence index {seq_index} got acked before it sent")]
+pub struct SeqIndexAckedBeforeSent {
+    pub seq_index: SeqIndex,
+}
+
+#[derive(Debug, Error)]
 pub enum PacketReceiveErrorKind {
     #[error("a packet with this id already exists with a different type")]
     Mismatch,
@@ -536,16 +531,10 @@ impl<T: Fn(&[u8]) -> io::Result<usize>> SendPacket for T {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
 enum PacketKind {
-    /// A self-contained (up to ~500 bytes) reliable packet.
-    SelfContained,
-    /// A single part of an up to ~8KiB reliable packet.
-    PartU4,
-    /// A single part of an up to ~128KiB reliable packet.
-    PartU8,
-    /// A single part of an up to ~32MiB reliable packet.
-    PartU16,
-    /// A single part of an up to ~2TiB reliable packet.
-    PartU32,
+    /// A part of a reliable packet.
+    Part,
+    /// The last part of a reliable packet.
+    LastPart,
     /// Confirms that a reliable packet (or part) has been received.
     Ack,
     /// Confirms that all acks of a reliable packet were received by the sender.
@@ -560,57 +549,16 @@ enum PacketKind {
     FirstUpdate,
 }
 
+/// How much payload a part packet can hold at most.
+///
+/// Everything except kind, id and seq_index.
+const PART_PACKET_PAYLOAD_SIZE: usize =
+    PACKET_DATA_SIZE - size_of::<PacketId>() - size_of::<SeqIndex>();
+
 /// Can store a single sequence index.
 type SeqIndex = u32;
 
-/// Can store both sequence index and max for any size.
-type SeqIndices = u64;
-
-/// What size to use for the sequence index and max.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SeqKind {
-    None = 0,
-    U4 = 4,
-    U8 = 8,
-    U16 = 16,
-    U32 = 32,
-}
-
-impl SeqKind {
-    /// All sequence index kinds in order of increasing potential packet size.
-    const SORTED_BY_MAX_BATCH_SIZE: [Self; 5] =
-        [Self::None, Self::U4, Self::U8, Self::U16, Self::U32];
-
-    /// The number of bits used to store a single sequence index.
-    ///
-    /// The total count must be stored as a max index to fit!
-    const fn bits(self) -> usize {
-        self as usize
-    }
-
-    /// The maximum number of chunks that can be sent in a batch using this kind of sequence index.
-    fn max_batch_size(self) -> usize {
-        1 << self.bits()
-    }
-
-    /// The packet kind identifying this kind of sequence index.
-    fn packet_kind(self) -> PacketKind {
-        match self {
-            Self::None => PacketKind::SelfContained,
-            Self::U4 => PacketKind::PartU4,
-            Self::U8 => PacketKind::PartU8,
-            Self::U16 => PacketKind::PartU16,
-            Self::U32 => PacketKind::PartU32,
-        }
-    }
-
-    /// How big a the data section of a chunk with this kind of sequence index is.
-    const fn chunk_size(self) -> usize {
-        PACKET_DATA_SIZE - size_of::<PacketId>() - self.bits() / 4
-    }
-}
-
-fn ack(id: PacketId, seq_index: u32, send: impl SendPacket) -> Result<(), PacketReceiveError> {
+fn ack(id: PacketId, seq_index: SeqIndex, send: impl SendPacket) -> Result<(), PacketReceiveError> {
     let mut ack = [0; 17 + size_of::<SeqIndex>()];
     ack[0] = PacketKind::Ack as u8;
     ack[1..17].copy_from_slice(id.as_bytes());

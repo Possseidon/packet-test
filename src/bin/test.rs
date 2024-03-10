@@ -1,10 +1,6 @@
-use rkyv::{
-    check_archived_root,
-    ser::{serializers::AllocSerializer, Serializer},
-    Archive, Serialize,
-};
+use rkyv::{Archive, Deserialize, Serialize};
 
-#[derive(Archive, Serialize)]
+#[derive(Clone, Debug, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 struct Person {
@@ -12,20 +8,9 @@ struct Person {
     age: i32,
 }
 
-// trait Packet: Archive + Serialize<AlignedSerializer<AlignedVec>> {}
-
 fn main() {
-    let value = Person {
-        name: "test".to_string(),
+    let _ = Person {
+        name: "testing".repeat(20),
         age: 10,
     };
-
-    let mut serializer = AllocSerializer::<512>::default();
-    serializer.serialize_value(&value).unwrap();
-    let mut bytes = serializer.into_serializer().into_inner();
-    println!("{:?}", bytes);
-    bytes[7] = 0x42;
-
-    let archived = check_archived_root::<Person>(&bytes[..]).unwrap();
-    println!("{:?}", archived);
 }

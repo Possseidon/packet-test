@@ -1,85 +1,80 @@
-use std::num::NonZeroUsize;
-
 use bitvec::vec::BitVec;
 use rkyv::AlignedVec;
 
-use super::{
-    PacketId, PacketReceiveErrorKind, ReceivedPacketAck, SeqIndex, SeqIndexOutOfRange, SeqKind,
-};
+use super::{PacketId, PacketReceiveErrorKind, SeqIndex, PART_PACKET_PAYLOAD_SIZE};
 
 /// Reassembles received packets.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ReassembledPacket {
     /// A buffer for the payload.
-    ///
-    /// Slightly bigger than necessary, since only the number of chunks is known.
     payload: AlignedVec,
-    /// Set to the proper length of the payload once the last packet is received.
-    payload_len: Option<NonZeroUsize>,
     /// Which chunks have been received so far.
-    ///
-    /// TODO: Replace with list of ranges since packets usually come in order
     received_chunks: BitVec,
+    /// The first chunk that has not been received yet.
+    first_pending: SeqIndex,
     /// How many chunks have been received so far.
     ///
     /// The final packet is not counted to prevent a theoretical [`SeqIndex`] overflow.
     received_count: SeqIndex,
+    /// Set to the index of the last packet once it is received.
+    max_index: Option<SeqIndex>,
 }
 
 impl ReassembledPacket {
-    pub(crate) fn new(seq_kind: SeqKind, seq_max: SeqIndex) -> Self {
-        let len = usize::try_from(seq_max).unwrap() + 1;
-        Self {
-            payload: AlignedVec::with_capacity(len * seq_kind.chunk_size()),
-            payload_len: None,
-            received_chunks: BitVec::repeat(false, usize::try_from(seq_max).unwrap()),
-            received_count: 0,
-        }
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
     pub(crate) fn receive(
         &mut self,
-        id: PacketId,
-        seq_kind: SeqKind,
+        last: bool,
         seq_index: SeqIndex,
         payload: &[u8],
-    ) -> Result<ReceivedPacketAck, PacketReceiveErrorKind> {
-        let chunk_count = self.received_chunks.len();
-        let seq_max = SeqIndex::try_from(chunk_count - 1).unwrap();
-        let index = usize::try_from(seq_index).unwrap();
-
-        if index >= self.received_chunks.len() {
-            return Err(PacketReceiveErrorKind::SeqIndexOutOfRange(
-                SeqIndexOutOfRange { seq_index, seq_max },
-            ));
+    ) -> ReceivedPacketAck {
+        if last {
+            self.max_index = Some(seq_index);
         }
 
-        let offset = index * seq_kind.chunk_size();
-        if !self.received_chunks.replace(index, true) {
-            if seq_index == seq_max {
-                self.payload_len = Some(
-                    NonZeroUsize::new((chunk_count - 1) * seq_kind.chunk_size() + payload.len())
-                        .unwrap(),
-                );
-            }
+        let chunk_index = usize::try_from(seq_index).unwrap();
+        let chunk_index_with_offset = chunk_index - usize::try_from(self.first_pending).unwrap();
+        if chunk_index_with_offset > self.received_chunks.len() {
+            self.received_chunks.resize(chunk_index_with_offset, false);
+        }
+        if self.received_chunks.replace(chunk_index_with_offset, true) {
+            return ReceivedPacketAck::Pending { duplicate: true };
+        }
+        let first_pending = self
+            .received_chunks
+            .first_zero()
+            .unwrap_or(self.received_chunks.len());
+        // round down to a byte boundary, so that the drain won't have to bitshift
+        let byte_boundary = first_pending & !0xFF;
+        self.received_chunks.drain(..byte_boundary);
+        self.first_pending += u32::try_from(byte_boundary).unwrap();
 
-            if offset < self.payload.len() {
-                self.payload[offset..offset + payload.len()].copy_from_slice(payload);
-            } else {
-                if offset > self.payload.len() {
-                    self.payload.resize(offset, 0);
-                }
-                self.payload.extend_from_slice(payload);
-            }
+        let payload_start = PART_PACKET_PAYLOAD_SIZE * chunk_index;
+        let payload_end = payload_start + payload.len();
+        if payload_end > self.payload.len() {
+            self.payload.resize(payload_end, 0);
+        }
 
-            if usize::try_from(self.received_count).unwrap() == self.received_chunks.len() - 1 {
-                Ok(ReceivedPacketAck::Done(&self.payload))
-            } else {
-                self.received_count += 1;
-                Ok(ReceivedPacketAck::Pending { duplicate: false })
-            }
+        self.payload[payload_start..payload_end].copy_from_slice(payload);
+        if Some(self.received_count) == self.max_index {
+            // don't count the last packet to prevent a theoretical overflow
+            ReceivedPacketAck::Done(&self.payload)
         } else {
-            Ok(ReceivedPacketAck::Pending { duplicate: true })
+            self.received_count += 1;
+            ReceivedPacketAck::Pending { duplicate: false }
         }
     }
+}
+
+pub(crate) enum ReceivedPacketAck<'a> {
+    /// A part of the packet was received and acked.
+    Pending {
+        /// Whether this packet was already received, which can happen when an ack gets dropped.
+        duplicate: bool,
+    },
+    /// The packet is fully assembled.
+    Done(&'a [u8]),
 }
