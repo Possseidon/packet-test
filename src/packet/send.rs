@@ -74,8 +74,8 @@ impl PacketOut {
     pub(crate) fn send_pending(
         &mut self,
         id: PacketId,
-        send: impl SendPacket,
         resend_delay: Duration,
+        send: impl SendPacket,
     ) -> io::Result<()> {
         if self.last_send.elapsed() < resend_delay {
             return Ok(());
@@ -195,7 +195,9 @@ impl PacketQueue {
         send: impl SendPacket,
     ) -> io::Result<BatchSize> {
         let mut count = 0;
+        println!("Sending unacked packets...");
         for packet in self.unacked(batch_size.get().into()) {
+            println!("  {} bytes", packet.len());
             send(packet)?;
             count += 1;
         }
@@ -249,6 +251,9 @@ pub(crate) struct PacketBuffer {
 }
 
 impl PacketBuffer {
+    const HEADER_LEN: usize =
+        size_of::<PacketKind>() + size_of::<PacketId>() + size_of::<SeqIndex>();
+
     pub(crate) fn new(id: PacketId) -> Self {
         let mut result = Self {
             acked: false,
@@ -278,12 +283,8 @@ impl PacketBuffer {
 
     pub(crate) fn next(&mut self) {
         assert_eq!(usize::from(self.len), PACKET_BUFFER_SIZE);
-        let start = size_of::<PacketKind>() + size_of::<PacketId>();
-        self.len = BufferIndex::try_from(start + size_of::<SeqIndex>()).unwrap();
-        let range = start..usize::from(self.len);
-        let next_seq_index =
-            SeqIndex::from_le_bytes(self.data[range.clone()].try_into().unwrap()) + 1;
-        self.data[range].copy_from_slice(&SeqIndex::to_le_bytes(next_seq_index));
+        self.len = BufferIndex::try_from(Self::HEADER_LEN).unwrap();
+        self.inc_seq_index();
     }
 
     pub(crate) fn mark_last(&mut self) {
@@ -301,15 +302,22 @@ impl PacketBuffer {
     }
 
     pub(crate) fn new_next(&self) -> Self {
-        let header_len = size_of::<PacketKind>() + size_of::<PacketId>() + size_of::<SeqIndex>();
         let mut result = Self {
             acked: false,
-            len: BufferIndex::try_from(header_len).unwrap(),
+            len: BufferIndex::try_from(Self::HEADER_LEN).unwrap(),
             data: Default::default(),
         };
-        result.data[..header_len].copy_from_slice(&self.data[..header_len]);
-        result.next();
+        result.data[..Self::HEADER_LEN].copy_from_slice(&self.data[..Self::HEADER_LEN]);
+        result.inc_seq_index();
         result
+    }
+
+    fn inc_seq_index(&mut self) {
+        let start = size_of::<PacketKind>() + size_of::<PacketId>();
+        let range = start..Self::HEADER_LEN;
+        let next_seq_index =
+            SeqIndex::from_le_bytes(self.data[range.clone()].try_into().unwrap()) + 1;
+        self.data[range].copy_from_slice(&SeqIndex::to_le_bytes(next_seq_index));
     }
 }
 

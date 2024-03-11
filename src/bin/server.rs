@@ -4,17 +4,36 @@
 // use packet_test::{handle_client_packets, ping_clients, timeout_clients, Server, ServerEntity};
 // use uuid::Uuid;
 
-fn main() {
-    // App::new()
-    //     .add_plugins((MinimalPlugins, LogPlugin::default()))
-    //     .add_systems(Startup, (setup, setup_server))
-    //     .add_systems(
-    //         Update,
-    //         (handle_client_packets, timeout_clients, ping_clients)
-    //             .run_if(resource_exists::<Server>),
-    //     )
-    //     .run();
+use std::{net::Ipv4Addr, time::Duration};
+
+use anyhow::Result;
+use packet_test::{server::Server, MyPackets};
+
+fn main() -> Result<()> {
+    let mut server = <Server>::host((Ipv4Addr::LOCALHOST, 42069))?;
+
+    // client.send(NoPacket, 1)?;
+
+    loop {
+        server.update()?;
+        // server.handle(|addr, packet| {
+        //     println!("{addr}: {packet:?}");
+        // })?;
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
+
+// fn main() {
+//     App::new()
+//         .add_plugins((MinimalPlugins, LogPlugin::default()))
+//         .add_systems(Startup, (setup, setup_server))
+//         .add_systems(
+//             Update,
+//             (handle_client_packets, timeout_clients, ping_clients)
+//                 .run_if(resource_exists::<Server>),
+//         )
+//         .run();
+// }
 
 // type Version = u64;
 

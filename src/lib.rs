@@ -2,6 +2,36 @@ pub mod client;
 pub mod packet;
 pub mod server;
 
+// temporary for testing
+
+use packet::{NoPacket, Packets};
+use rkyv::{Archive, Serialize};
+
+pub struct MyPackets;
+
+#[derive(Debug, Archive, Serialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct Big([u8; 3]);
+
+impl Packets for MyPackets {
+    type Query = NoPacket;
+    type Status = NoPacket;
+
+    type Connect = NoPacket;
+    type Disconnect = NoPacket;
+
+    type Accept = NoPacket;
+    type Reject = NoPacket;
+    type Kick = NoPacket;
+
+    type Server = NoPacket;
+    type Client = NoPacket;
+
+    type ServerUpdate = NoPacket;
+    type ClientUpdate = NoPacket;
+}
+
 // use std::{
 //     io::{self, ErrorKind},
 //     iter::once,

@@ -1,16 +1,13 @@
-use rkyv::{Archive, Deserialize, Serialize};
+use std::sync::{Arc, Weak};
+
+use rkyv::{to_bytes, Archive, Deserialize, Serialize};
 
 #[derive(Clone, Debug, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
-struct Person {
-    name: String,
-    age: i32,
+enum Test {
+    Small,
+    Big(Option<Weak<[u8; 1024]>>),
 }
 
-fn main() {
-    let _ = Person {
-        name: "testing".repeat(20),
-        age: 10,
-    };
-}
+fn main() {}

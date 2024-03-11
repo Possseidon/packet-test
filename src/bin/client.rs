@@ -11,16 +11,34 @@
 // };
 // use uuid::Uuid;
 
-fn main() {
-    // App::new()
-    //     .add_plugins(DefaultPlugins)
-    //     .add_systems(Startup, (setup, connect_to_server))
-    //     .add_systems(
-    //         Update,
-    //         (handle_server_packets, check_server_alive).run_if(resource_exists::<Client>),
-    //     )
-    //     .run();
+use std::{net::Ipv4Addr, time::Duration};
+
+use anyhow::Result;
+use packet_test::{client::Client, MyPackets};
+
+fn main() -> Result<()> {
+    let mut client = <Client>::new()?;
+    client.connect((Ipv4Addr::LOCALHOST, 42069), ())?;
+
+    // client.send(NoPacket, 1)?;
+
+    loop {
+        client.update()?;
+        // client.handle()?;
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
+
+// fn main() {
+//     App::new()
+//         .add_plugins(DefaultPlugins)
+//         .add_systems(Startup, (setup, connect_to_server))
+//         .add_systems(
+//             Update,
+//             (handle_server_packets, check_server_alive).run_if(resource_exists::<Client>),
+//         )
+//         .run();
+// }
 
 // fn setup(
 //     mut commands: Commands,

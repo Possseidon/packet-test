@@ -1,5 +1,6 @@
 use std::{
     convert::Infallible,
+    num::NonZeroUsize,
     sync::mpsc::{sync_channel, Receiver, SyncSender},
     thread,
 };
@@ -10,7 +11,7 @@ use super::{send::PacketBuffer, Packet, PacketId};
 
 /// Serializes the packet, automatically switching to a thread if necessary.
 ///
-/// 1. Serializes up to `max_direct` packets into a [`Vec`].
+/// 1. Serializes up to `background_serialization_threshold` packets into a [`Vec`].
 /// 2. If more packets are required, spawns a detached thread and returns a channel.
 ///
 /// The thread uses a rendezvous channel, so it only prepares a single packet without buffering
@@ -18,21 +19,26 @@ use super::{send::PacketBuffer, Packet, PacketId};
 /// remaining write calls and should finish relatively quickly.
 pub(crate) fn serialize_packet<T: Packet>(
     id: PacketId,
-    max_direct: usize,
+    background_serialization_threshold: usize,
     value: T,
 ) -> SerializedPacket {
-    let mut serializer = VecPacketSerializer {
-        max_packets: max_direct,
-        buffer: vec![PacketBuffer::new(id)],
-    };
-    if serializer.serialize_value(&value).is_ok() {
-        return SerializedPacket::Vec(serializer.buffer);
+    if let Some(background_serialization_threshold) =
+        NonZeroUsize::new(background_serialization_threshold)
+    {
+        let mut serializer = VecPacketSerializer {
+            background_serialization_threshold,
+            buf: vec![PacketBuffer::new(id)],
+        };
+        if serializer.serialize_value(&value).is_ok() {
+            return SerializedPacket::Vec(serializer.buf);
+        }
     }
 
+    println!("Using a channel for serialization...");
     let (tx, rx) = sync_channel(0);
     thread::spawn(move || {
         ChannelPacketSerializer {
-            buffer: PacketBuffer::new(id),
+            buf: PacketBuffer::new(id),
             tx: Some(tx),
         }
         .serialize_value(&value)
@@ -46,10 +52,9 @@ pub(crate) enum SerializedPacket {
     Channel(Receiver<PacketBuffer>),
 }
 
-#[derive(Default)]
 pub struct VecPacketSerializer {
-    max_packets: usize,
-    buffer: Vec<PacketBuffer>,
+    background_serialization_threshold: NonZeroUsize,
+    buf: Vec<PacketBuffer>,
 }
 
 impl Fallible for VecPacketSerializer {
@@ -63,8 +68,8 @@ impl Serializer for VecPacketSerializer {
 
     fn write(&mut self, mut bytes: &[u8]) -> Result<(), Self::Error> {
         while !bytes.is_empty() {
-            let at_limit = self.buffer.len() == self.max_packets;
-            let last = self.buffer.last_mut().expect("should not be empty");
+            let at_limit = self.buf.len() == self.background_serialization_threshold.get();
+            let last = self.buf.last_mut().expect("should not be empty");
             let before = bytes.len();
             bytes = last.append(bytes);
             let after = bytes.len();
@@ -73,7 +78,7 @@ impl Serializer for VecPacketSerializer {
                     return Err(());
                 }
                 let packet = last.new_next();
-                self.buffer.push(packet);
+                self.buf.push(packet);
             }
         }
         Ok(())
@@ -81,7 +86,7 @@ impl Serializer for VecPacketSerializer {
 }
 
 pub struct ChannelPacketSerializer {
-    buffer: PacketBuffer,
+    buf: PacketBuffer,
     tx: Option<SyncSender<PacketBuffer>>,
 }
 
@@ -101,14 +106,14 @@ impl Serializer for ChannelPacketSerializer {
         };
         while !bytes.is_empty() {
             let before = bytes.len();
-            bytes = self.buffer.append(bytes);
+            bytes = self.buf.append(bytes);
             let after = bytes.len();
             if after == before {
-                if tx.send(self.buffer.copy()).is_err() {
+                if tx.send(self.buf.copy()).is_err() {
                     self.tx = None;
                     return Ok(());
                 }
-                self.buffer.next();
+                self.buf.next();
             }
         }
         Ok(())
@@ -118,9 +123,9 @@ impl Serializer for ChannelPacketSerializer {
 impl Drop for ChannelPacketSerializer {
     fn drop(&mut self) {
         if let Some(tx) = &self.tx {
-            assert!(!self.buffer.is_empty());
-            self.buffer.mark_last();
-            tx.send(self.buffer.copy()).unwrap();
+            assert!(!self.buf.is_empty());
+            self.buf.mark_last();
+            tx.send(self.buf.copy()).unwrap();
         }
     }
 }

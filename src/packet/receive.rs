@@ -30,7 +30,7 @@ impl ReassembledPacket {
         last: bool,
         seq_index: SeqIndex,
         payload: &[u8],
-    ) -> ReceivedPacketAck {
+    ) -> ReceivedPacket {
         if last {
             self.max_index = Some(seq_index);
         }
@@ -41,7 +41,7 @@ impl ReassembledPacket {
             self.received_chunks.resize(chunk_index_with_offset, false);
         }
         if self.received_chunks.replace(chunk_index_with_offset, true) {
-            return ReceivedPacketAck::Pending { duplicate: true };
+            return ReceivedPacket::Pending { duplicate: true };
         }
         let first_pending = self
             .received_chunks
@@ -52,7 +52,7 @@ impl ReassembledPacket {
         self.received_chunks.drain(..byte_boundary);
         self.first_pending += u32::try_from(byte_boundary).unwrap();
 
-        let payload_start = PART_PACKET_PAYLOAD_SIZE * chunk_index;
+        let payload_start = PART_PACKET_PAYLOAD_SIZE.get() * chunk_index;
         let payload_end = payload_start + payload.len();
         if payload_end > self.payload.len() {
             self.payload.resize(payload_end, 0);
@@ -61,20 +61,21 @@ impl ReassembledPacket {
         self.payload[payload_start..payload_end].copy_from_slice(payload);
         if Some(self.received_count) == self.max_index {
             // don't count the last packet to prevent a theoretical overflow
-            ReceivedPacketAck::Done(&self.payload)
+            ReceivedPacket::Reassembled(&self.payload)
         } else {
             self.received_count += 1;
-            ReceivedPacketAck::Pending { duplicate: false }
+            ReceivedPacket::Pending { duplicate: false }
         }
     }
 }
 
-pub(crate) enum ReceivedPacketAck<'a> {
-    /// A part of the packet was received and acked.
+/// A part of a packet was received.
+pub(crate) enum ReceivedPacket<'a> {
+    /// A part of the packet was received, but the packet is not fully assembled.
     Pending {
-        /// Whether this packet was already received, which can happen when an ack gets dropped.
+        /// Whether this packet was already received.
         duplicate: bool,
     },
-    /// The packet is fully assembled.
-    Done(&'a [u8]),
+    /// The last part was acked and the packet is fully assembled.
+    Reassembled(&'a [u8]),
 }
