@@ -37,8 +37,9 @@ impl ReassembledPacket {
 
         let chunk_index = usize::try_from(seq_index).unwrap();
         let chunk_index_with_offset = chunk_index - usize::try_from(self.first_pending).unwrap();
-        if chunk_index_with_offset > self.received_chunks.len() {
-            self.received_chunks.resize(chunk_index_with_offset, false);
+        if chunk_index_with_offset >= self.received_chunks.len() {
+            self.received_chunks
+                .resize(chunk_index_with_offset + 1, false);
         }
         if self.received_chunks.replace(chunk_index_with_offset, true) {
             return ReceivedPacket::Pending { duplicate: true };

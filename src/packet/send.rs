@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    io,
+    io::{self, ErrorKind},
     iter::zip,
     mem::{replace, size_of},
     ops::{Deref, DerefMut},
@@ -12,7 +12,7 @@ use rkyv::AlignedBytes;
 
 use super::{
     serialize::SerializedPacket, BatchSize, BufferIndex, NonZeroBatchSize, PacketId, PacketKind,
-    SendPacket, SeqIndex, SeqIndexAckedBeforeSent, PACKET_BUFFER_SIZE,
+    SendPacket, SeqIndex, SeqIndexAckedBeforeSent, PACKET_BUFFER_SIZE, PART_PACKET_PAYLOAD_SIZE,
 };
 
 /// Stores packets of any size so that they can be sent reliably.
@@ -29,7 +29,9 @@ pub(crate) struct PacketOut {
     /// Up to how many packets are sent at once.
     batch_size: NonZeroBatchSize,
     /// How many packets were sent in the last batch.
-    last_batch_size: NonZeroBatchSize,
+    ///
+    /// Can be zero if the socket is busy and would block.
+    last_batch_size: BatchSize,
     /// How many acks have been received for the last batch.
     last_batch_acks: BatchSize,
 }
@@ -41,9 +43,8 @@ impl PacketOut {
         initial_batch_size: NonZeroBatchSize,
     ) -> io::Result<Self> {
         let mut packet_queue = PacketQueue::new(packet);
-        let last_batch_size =
-            NonZeroBatchSize::new(packet_queue.send_unacked(initial_batch_size, send)?)
-                .expect("packet should not be empty");
+        let (last_batch_size, _would_block) =
+            packet_queue.send_unacked(initial_batch_size, send)?;
         let now = Instant::now();
         Ok(Self {
             packet_queue,
@@ -69,31 +70,38 @@ impl PacketOut {
 
     /// Resends parts of the packet that have not yet been acked.
     ///
-    /// - `id`: The id of the packet.
-    /// - `send`: The function to send the packet; e.g. [`std::net::UdpSocket::send`].
+    /// Returns `true` if the entire packet was acked and a `Done` was sent out.
     pub(crate) fn send_pending(
         &mut self,
         id: PacketId,
         resend_delay: Duration,
         send: impl SendPacket,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if self.last_send.elapsed() < resend_delay {
-            return Ok(());
+            return Ok(false);
         }
 
         self.batch_size =
             Self::balance_batch_size(self.batch_size, self.last_batch_acks, self.last_batch_size);
 
-        if let Some(count) =
-            NonZeroBatchSize::new(self.packet_queue.send_unacked(self.batch_size, &send)?)
-        {
-            self.last_batch_size = count;
-        } else {
-            done(id, send)?;
+        match self.packet_queue.send_unacked(self.batch_size, &send)? {
+            (0, false) => {
+                if let Err(error) = done(id, send) {
+                    if error.kind() == ErrorKind::WouldBlock {
+                        // could not send out done, try again later
+                        return Ok(false);
+                    }
+                    Err(error)?
+                }
+                Ok(true)
+            }
+            (count, _would_block) => {
+                self.last_batch_size = count;
+                self.last_batch_acks = 0;
+                self.last_send = Instant::now();
+                Ok(false)
+            }
         }
-        self.last_batch_acks = 0;
-        self.last_send = Instant::now();
-        Ok(())
     }
 
     /// Returns the current number of bytes of the payload that are being sent every second.
@@ -103,8 +111,7 @@ impl PacketOut {
 
     /// Returns an estimate for the number of payload bytes that have been acked.
     pub(crate) fn acked_bytes(&self) -> usize {
-        // TODO: improve estimation; PACKET_BUFFER_SIZE is too large
-        self.packet_queue.first_unacked * PACKET_BUFFER_SIZE
+        self.packet_queue.first_unacked * PART_PACKET_PAYLOAD_SIZE.get()
     }
 
     /// Since when the sender is waiting for an ack.
@@ -124,27 +131,29 @@ impl PacketOut {
     /// This is only an estimate and might even be bigger than [`Self::payload_bytes()`], but since
     /// this is intended to be used for measuring throughput, it should not matter all that much.
     fn last_batch_bytes(&self) -> usize {
-        // TODO: improve estimation, PACKET_BUFFER_SIZE is too large
-        usize::from(self.last_batch_size.get()) * PACKET_BUFFER_SIZE
+        usize::from(self.last_batch_size) * PART_PACKET_PAYLOAD_SIZE.get()
     }
 
     /// Adjusts the batch size based on the number of acked chunks.
     fn balance_batch_size(
         old_batch_size: NonZeroBatchSize,
         last_batch_acks: BatchSize,
-        last_batch_size: NonZeroBatchSize,
+        last_batch_size: BatchSize,
     ) -> NonZeroBatchSize {
         // acked_count might be greater if the client is pretending to receive packets that were
         // never sent; since the sender does not remember which packets it sent, just ignore it
-        if last_batch_acks >= last_batch_size.get() {
+        if last_batch_acks >= last_batch_size {
             // all packets of the last batch were acked, try up to twice as much next time
             //
             // using last_batch_size instead of old_batch_size prevents the batch size from growing
             // indefinitely if there are a lot of tiny packets that all get acked
-            let doubled_last_batch_size =
-                last_batch_size.saturating_mul(NonZeroBatchSize::new(2).unwrap());
+            let doubled_last_batch_size = last_batch_size.saturating_mul(2);
             // a batch can contain less than old_batch_size packets, never lower it
-            old_batch_size.max(doubled_last_batch_size)
+            old_batch_size.max(
+                doubled_last_batch_size
+                    .try_into()
+                    .unwrap_or(NonZeroBatchSize::MIN),
+            )
         } else {
             // not all packets of the last batch were acked, cut the batch size in half
             //
@@ -153,7 +162,7 @@ impl PacketOut {
             // batch size down all the way to one unnecessarily
             let halfed = old_batch_size.get() / 2;
             // a batch shoould always contain at least one packet
-            NonZeroBatchSize::new(halfed).unwrap_or(NonZeroBatchSize::MIN)
+            halfed.try_into().unwrap_or(NonZeroBatchSize::MIN)
         }
     }
 }
@@ -188,20 +197,30 @@ impl PacketQueue {
         }
     }
 
-    /// Sends up to `batch_size` packets and returns the number of packets that were actually sent.
+    /// Sends up to `batch_size` packets.
+    ///
+    /// Returns the number of packets that were actually sent and if the send function would have
+    /// blocked at some point.
+    ///
+    /// `Ok((0, false))` means, all packets are acked.
     fn send_unacked(
         &mut self,
         batch_size: NonZeroBatchSize,
         send: impl SendPacket,
-    ) -> io::Result<BatchSize> {
+    ) -> io::Result<(BatchSize, bool)> {
         let mut count = 0;
         println!("Sending unacked packets...");
-        for packet in self.unacked(batch_size.get().into()) {
-            println!("  {} bytes", packet.len());
-            send(packet)?;
+        for buf in self.unacked(batch_size.get().into()) {
+            println!("  {} bytes", buf.len());
+            if let Err(error) = send(buf) {
+                if error.kind() == ErrorKind::WouldBlock {
+                    return Ok((count, true));
+                }
+                Err(error)?
+            }
             count += 1;
         }
-        Ok(count)
+        Ok((count, false))
     }
 
     fn unacked(&mut self, count: usize) -> impl Iterator<Item = &[u8]> {
@@ -224,6 +243,7 @@ impl PacketQueue {
 
     /// Marks the packet as acked and returns true if it was already acked previously.
     fn ack(&mut self, seq_index: SeqIndex) -> Result<bool, SeqIndexAckedBeforeSent> {
+        println!("  received ack for {seq_index}");
         let acked = &mut self
             .packets
             .get_mut(usize::try_from(seq_index).unwrap())
@@ -244,7 +264,7 @@ impl PacketQueue {
     }
 }
 
-pub(crate) struct PacketBuffer {
+pub struct PacketBuffer {
     acked: bool,
     len: BufferIndex,
     data: AlignedBytes<PACKET_BUFFER_SIZE>,

@@ -1,6 +1,5 @@
-pub mod client;
+pub mod net;
 pub mod packet;
-pub mod server;
 
 // temporary for testing
 

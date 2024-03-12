@@ -7,18 +7,12 @@
 use std::{net::Ipv4Addr, time::Duration};
 
 use anyhow::Result;
-use packet_test::{server::Server, MyPackets};
+use packet_test::net::{server::Server, DefaultConnectionHandler};
 
 fn main() -> Result<()> {
     let mut server = <Server>::host((Ipv4Addr::LOCALHOST, 42069))?;
-
-    // client.send(NoPacket, 1)?;
-
     loop {
-        server.update()?;
-        // server.handle(|addr, packet| {
-        //     println!("{addr}: {packet:?}");
-        // })?;
+        server.update(&mut DefaultConnectionHandler);
         std::thread::sleep(Duration::from_millis(100));
     }
 }

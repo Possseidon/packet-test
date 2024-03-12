@@ -102,7 +102,7 @@ impl<T: Serialize<VecPacketSerializer> + Serialize<ChannelPacketSerializer> + Se
 /// Server packets for dealing with client connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize)]
 #[archive(check_bytes)]
-pub(crate) enum ServerConnectionPacket<P: Packets> {
+pub enum ServerConnectionPacket<P: Packets> {
     Status(P::Status),
     Accept(P::Accept),
     Reject(P::Reject),
@@ -113,7 +113,7 @@ pub(crate) enum ServerConnectionPacket<P: Packets> {
 /// Client packets for establishing a server connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize)]
 #[archive(check_bytes)]
-pub(crate) enum ClientConnectionPacket<P: Packets> {
+pub enum ClientConnectionPacket<P: Packets> {
     Query(P::Query),
     Connect(P::Connect),
     Disconnect(P::Disconnect),
@@ -122,6 +122,7 @@ pub(crate) enum ClientConnectionPacket<P: Packets> {
 
 pub(crate) type ServerPacketBuffers<P> =
     PacketBuffers<ServerConnectionPacket<P>, ClientConnectionPacket<P>>;
+
 pub(crate) type ClientPacketBuffers<P> =
     PacketBuffers<ClientConnectionPacket<P>, ServerConnectionPacket<P>>;
 
@@ -157,13 +158,13 @@ impl Archive for NoPacket {
     type Archived = ArchivedNoPacket;
     type Resolver = ();
 
-    unsafe fn resolve(&self, pos: usize, resolver: Self::Resolver, out: *mut Self::Archived) {
+    unsafe fn resolve(&self, _pos: usize, _resolver: Self::Resolver, _out: *mut Self::Archived) {
         unreachable!();
     }
 }
 
 impl<S: Fallible + ?Sized> Serialize<S> for NoPacket {
-    fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+    fn serialize(&self, _serializer: &mut S) -> Result<Self::Resolver, S::Error> {
         unreachable!()
     }
 }
@@ -175,8 +176,8 @@ impl<C: ?Sized> CheckBytes<C> for ArchivedNoPacket {
     type Error = Infallible;
 
     unsafe fn check_bytes<'a>(
-        value: *const Self,
-        context: &mut C,
+        _value: *const Self,
+        _context: &mut C,
     ) -> Result<&'a Self, Self::Error> {
         unreachable!()
     }
@@ -233,6 +234,7 @@ impl Default for ConnectionConfig {
 /// Server specific configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServerConfig {
+    pub connection: ConnectionConfig,
     /// How long to wait between each ping.
     ///
     /// Should be considerably less than [`ConnectionConfig::timeout`] to avoid timeouts when there
@@ -243,6 +245,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            connection: Default::default(),
             ping_delay: Duration::from_secs(3),
         }
     }
@@ -300,7 +303,7 @@ impl<S: Packet, R: Packet> PacketBuffers<S, R> {
         send: impl SendPacket,
     ) -> io::Result<()> {
         self.timeout_packets(timeout);
-        self.send_pending(resend_delay, &send)?;
+        self.send_pending(resend_delay, send)?;
         Ok(())
     }
 
@@ -309,7 +312,7 @@ impl<S: Packet, R: Packet> PacketBuffers<S, R> {
         buf: &'a [u8],
         send: impl SendPacket,
     ) -> Result<PacketHandling<'a>, HandlePacketError> {
-        match self.receive_buffer.handle(buf, &send)? {
+        match self.receive_buffer.handle(buf, send)? {
             ReceivedPacketHandling::Ack(received) => return Ok(PacketHandling::Received(received)),
             ReceivedPacketHandling::Done => return Ok(PacketHandling::Done),
             ReceivedPacketHandling::Unhandled => {}
@@ -331,6 +334,7 @@ impl<S: Packet, R: Packet> PacketBuffers<S, R> {
 
     fn timeout_packets(&mut self, timeout: Duration) {
         self.send_buffer.timeout_packets(timeout);
+        self.receive_buffer.timeout_packets(timeout);
     }
 }
 
@@ -432,16 +436,27 @@ impl SendPacketBuffer {
     fn send_pending(&mut self, resend_delay: Duration, send: impl SendPacket) -> io::Result<()> {
         let mut batch_size: usize = 0;
         let mut count: usize = 0;
-        for (id, packet) in &mut self.packets {
-            packet.send_pending(*id, resend_delay, &send)?;
+        let mut result = Ok(());
+        self.packets.retain(|id, packet| {
             batch_size = batch_size.saturating_add(usize::from(packet.batch_size().get()));
             count += 1;
-        }
+            if result.is_err() {
+                return true;
+            }
+            match packet.send_pending(*id, resend_delay, &send) {
+                Ok(fully_acked) => !fully_acked,
+                Err(error) => {
+                    result = Err(error);
+                    true
+                }
+            }
+        });
         if count != 0 {
             let batch_size = BatchSize::try_from(batch_size / count).unwrap_or(BatchSize::MAX);
             self.batch_size = NonZeroBatchSize::new(batch_size).unwrap_or(NonZeroBatchSize::MIN);
         }
-        Ok(())
+
+        result
     }
 
     /// Returns statistics about the packet with the given id.
@@ -464,12 +479,12 @@ impl SendPacketBuffer {
             .ack(seq_index)?)
     }
 
-    /// Forget packets that did not receive acks in a long time.
+    /// Forget packets that did not get acks in a long time.
     fn timeout_packets(&mut self, timeout: Duration) {
         self.packets.retain(|id, packet| {
             let within_timeout = packet.awaiting_ack_since().elapsed() < timeout;
             if !within_timeout {
-                println!("{id:?} timed out");
+                println!("{id:?} timed out because it did not get acks in {timeout:?}");
             }
             within_timeout
         });
@@ -599,12 +614,12 @@ impl ReceivePacketBuffer {
                         last_receive: Instant::now(),
                         packet: None,
                     });
-                    ack(id, seq_index, send)?;
+                    ack(id, seq_index, send)?; // TODO: ignore WouldBlock
                     Ok(ReceivedPacket::Reassembled(payload))
                 }
                 Entry::Occupied(entry) => {
                     if entry.get().packet.is_none() {
-                        ack(id, seq_index, send)?;
+                        ack(id, seq_index, send)?; // TODO: ignore WouldBlock
                         Ok(ReceivedPacket::Pending { duplicate: true })
                     } else {
                         Err(PacketReceiveError {
@@ -621,7 +636,7 @@ impl ReceivePacketBuffer {
             });
             if let Some(packet) = &mut packet.packet {
                 let received_packet = packet.receive(last, seq_index, payload);
-                ack(id, seq_index, send)?;
+                ack(id, seq_index, send)?; // TODO: ignore WouldBlock
                 Ok(received_packet)
             } else {
                 Err(PacketReceiveError {
@@ -645,10 +660,15 @@ impl ReceivePacketBuffer {
         todo!()
     }
 
-    /// Forget packets that did not receive anything in a long time.
+    /// Forget packets that did not receive data in a long time.
     fn timeout_packets(&mut self, timeout: Duration) {
-        self.packets
-            .retain(|_, packet| packet.last_receive.elapsed() < timeout);
+        self.packets.retain(|id, packet| {
+            let within_timeout = packet.last_receive.elapsed() < timeout;
+            if !within_timeout {
+                println!("{id:?} timed out because it did not get new data in {timeout:?}");
+            }
+            within_timeout
+        });
     }
 }
 

@@ -1,5 +1,6 @@
 use std::{
     convert::Infallible,
+    mem::take,
     num::NonZeroUsize,
     sync::mpsc::{sync_channel, Receiver, SyncSender},
     thread,
@@ -22,22 +23,32 @@ pub(crate) fn serialize_packet<T: Packet>(
     background_serialization_threshold: usize,
     value: T,
 ) -> SerializedPacket {
-    if let Some(background_serialization_threshold) =
+    let already_serialized = if let Some(background_serialization_threshold) =
         NonZeroUsize::new(background_serialization_threshold)
     {
         let mut serializer = VecPacketSerializer {
             background_serialization_threshold,
             buf: vec![PacketBuffer::new(id)],
         };
-        if serializer.serialize_value(&value).is_ok() {
-            return SerializedPacket::Vec(serializer.buf);
+        match serializer.serialize_value(&value) {
+            Ok(_) => return SerializedPacket::Vec(serializer.buf),
+            Err(already_serialized) => already_serialized,
         }
-    }
+    } else {
+        Default::default()
+    };
 
-    println!("Using a channel for serialization...");
     let (tx, rx) = sync_channel(0);
     thread::spawn(move || {
+        let skip = already_serialized.len();
+        for buf in already_serialized {
+            if tx.send(buf).is_err() {
+                return;
+            }
+        }
+
         ChannelPacketSerializer {
+            skip,
             buf: PacketBuffer::new(id),
             tx: Some(tx),
         }
@@ -58,7 +69,7 @@ pub struct VecPacketSerializer {
 }
 
 impl Fallible for VecPacketSerializer {
-    type Error = ();
+    type Error = Vec<PacketBuffer>;
 }
 
 impl Serializer for VecPacketSerializer {
@@ -75,7 +86,7 @@ impl Serializer for VecPacketSerializer {
             let after = bytes.len();
             if after == before {
                 if at_limit {
-                    return Err(());
+                    return Err(take(&mut self.buf));
                 }
                 let packet = last.new_next();
                 self.buf.push(packet);
@@ -86,6 +97,7 @@ impl Serializer for VecPacketSerializer {
 }
 
 pub struct ChannelPacketSerializer {
+    skip: usize,
     buf: PacketBuffer,
     tx: Option<SyncSender<PacketBuffer>>,
 }
@@ -109,9 +121,11 @@ impl Serializer for ChannelPacketSerializer {
             bytes = self.buf.append(bytes);
             let after = bytes.len();
             if after == before {
-                if tx.send(self.buf.copy()).is_err() {
+                if self.skip > 0 {
+                    self.skip -= 1;
+                } else if tx.send(self.buf.copy()).is_err() {
                     self.tx = None;
-                    return Ok(());
+                    break;
                 }
                 self.buf.next();
             }
@@ -125,6 +139,7 @@ impl Drop for ChannelPacketSerializer {
         if let Some(tx) = &self.tx {
             assert!(!self.buf.is_empty());
             self.buf.mark_last();
+            assert!(self.skip == 0);
             tx.send(self.buf.copy()).unwrap();
         }
     }

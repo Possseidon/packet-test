@@ -14,17 +14,13 @@
 use std::{net::Ipv4Addr, time::Duration};
 
 use anyhow::Result;
-use packet_test::{client::Client, MyPackets};
+use packet_test::net::{client::Client, DefaultConnectionHandler};
 
 fn main() -> Result<()> {
     let mut client = <Client>::new()?;
     client.connect((Ipv4Addr::LOCALHOST, 42069), ())?;
-
-    // client.send(NoPacket, 1)?;
-
     loop {
-        client.update()?;
-        // client.handle()?;
+        client.update(&mut DefaultConnectionHandler);
         std::thread::sleep(Duration::from_millis(100));
     }
 }
