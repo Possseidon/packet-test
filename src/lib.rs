@@ -3,7 +3,9 @@ pub mod packet;
 
 // temporary for testing
 
-use packet::{NoPacket, Packets};
+use std::convert::Infallible;
+
+use packet::{NoPacket, NoVersion, Packets};
 use rkyv::{Archive, Serialize};
 
 pub struct MyPackets;
@@ -14,6 +16,9 @@ pub struct MyPackets;
 pub struct Big([u8; 3]);
 
 impl Packets for MyPackets {
+    type Version = NoVersion;
+    type CompatibilityError = Infallible;
+
     type Query = NoPacket;
     type Status = NoPacket;
 

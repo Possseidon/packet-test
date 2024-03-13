@@ -38,6 +38,21 @@ pub type BufferIndex = u16;
 
 /// Various packet types that are used by server and client to communicate with each other.
 pub trait Packets: 'static {
+    /// Sent out by the server upon the client requesting its version by sending an empty packet.
+    ///
+    /// Used to determine if the client and server are compatible in terms of packets.
+    ///
+    /// It is highly recommended for the layout of this packet to either not change or at least be
+    /// backward/forward compatible. By doing so, there will be no false positives when checking
+    /// compatibility and it also allows for nicer error messages in the case of incompatibility.
+    ///
+    /// I.e. if the layout changes, the client can no longer know the exact version of the server
+    /// or (while unlikely) it might even interpret an incompatible version packet as being
+    /// compatible to its own version.
+    type Version: VersionPacket;
+    /// Contains additional information in case of a version mismatch.
+    type CompatibilityError: std::error::Error;
+
     /// Sent out by the client to query status information from a server.
     ///
     /// Can also be used to discover servers by sending a broadcast.
@@ -72,6 +87,9 @@ pub trait Packets: 'static {
 pub struct DefaultPackets;
 
 impl Packets for DefaultPackets {
+    type Version = NoVersion;
+    type CompatibilityError = Infallible;
+
     type Query = ();
     type Status = ();
 
@@ -126,6 +144,36 @@ pub(crate) type ServerPacketBuffers<P> =
 pub(crate) type ClientPacketBuffers<P> =
     PacketBuffers<ClientConnectionPacket<P>, ServerConnectionPacket<P>>;
 
+#[derive(Debug, Error)]
+#[error("malformed version packet")]
+pub struct MalformedVersion;
+
+pub trait VersionPacket: Sized {
+    /// Writes version information to the given buffer.
+    ///
+    /// Returns the number of bytes written, which must be at most [`PACKET_DATA_SIZE`].
+    fn write(&self, buf: &mut [u8]) -> usize;
+
+    /// Tries to read version information from the given buffer.
+    fn read(buf: &[u8]) -> Result<Self, MalformedVersion>;
+}
+
+/// Does not contain any version information but only accepts empty packets in response as well.
+pub struct NoVersion;
+
+impl VersionPacket for NoVersion {
+    fn write(&self, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn read(buf: &[u8]) -> Result<Self, MalformedVersion> {
+        if buf.is_empty() {
+            Ok(NoVersion)
+        } else {
+            Err(MalformedVersion)
+        }
+    }
+}
 /// Packets for things that constantly change, which means it's okay if some are dropped.
 ///
 /// These packets must fit into a single datagram.
@@ -133,16 +181,14 @@ pub(crate) type ClientPacketBuffers<P> =
 pub trait UpdatePacket: Sized {
     type ReadError: std::error::Error;
 
-    /// Lower bound for the size of the packet.
+    /// The size of the packet, which must be at most [`PACKET_BUFFER_SIZE`].
     ///
     /// Used as an upfront check to see if the packet might fit in the remaining buffer.
-    ///
-    /// Must be at most [`PACKET_BUFFER_SIZE`].
     fn len(&self) -> NonZeroBufferIndex;
 
-    /// Writes [`UpdatePacket::len()`] bytes to the given buffer.
+    /// Writes exactly [`UpdatePacket::len()`] bytes to the given buffer.
     ///
-    /// The first byte must be at least [`PacketKind::FirstUpdate`].
+    /// Panics if the buffer is too small.
     fn write(&self, buf: &mut [u8]);
 
     /// Tries to read a packet from the given buffer.
@@ -159,13 +205,13 @@ impl Archive for NoPacket {
     type Resolver = ();
 
     unsafe fn resolve(&self, _pos: usize, _resolver: Self::Resolver, _out: *mut Self::Archived) {
-        unreachable!();
+        match *self {}
     }
 }
 
 impl<S: Fallible + ?Sized> Serialize<S> for NoPacket {
     fn serialize(&self, _serializer: &mut S) -> Result<Self::Resolver, S::Error> {
-        unreachable!()
+        match *self {}
     }
 }
 
@@ -179,7 +225,7 @@ impl<C: ?Sized> CheckBytes<C> for ArchivedNoPacket {
         _value: *const Self,
         _context: &mut C,
     ) -> Result<&'a Self, Self::Error> {
-        unreachable!()
+        match *_value {}
     }
 }
 
@@ -191,11 +237,11 @@ impl UpdatePacket for NoPacket {
     type ReadError = NoUpdateError;
 
     fn len(&self) -> NonZeroBufferIndex {
-        unreachable!()
+        match *self {}
     }
 
     fn write(&self, _buf: &mut [u8]) {
-        unreachable!()
+        match *self {}
     }
 
     fn read(_buf: &[u8]) -> Result<Self, Self::ReadError> {
@@ -402,7 +448,8 @@ impl SendPacketBuffer {
                             .map_err(|kind| PacketAckError { id, kind })?,
                     })
                 }
-                PacketKind::Part
+                PacketKind::Version
+                | PacketKind::Part
                 | PacketKind::LastPart
                 | PacketKind::Done
                 | PacketKind::FirstUpdate => Ok(SentPacketHandling::Unhandled),
@@ -591,7 +638,9 @@ impl ReceivePacketBuffer {
                     self.done(id()?)?;
                     Ok(ReceivedPacketHandling::Done)
                 }
-                PacketKind::Ack | PacketKind::FirstUpdate => Ok(ReceivedPacketHandling::Unhandled),
+                PacketKind::Version | PacketKind::Ack | PacketKind::FirstUpdate => {
+                    Ok(ReceivedPacketHandling::Unhandled)
+                }
             }
         } else {
             Ok(ReceivedPacketHandling::Unhandled)
@@ -757,6 +806,11 @@ impl<F: Fn(&mut [u8]) -> io::Result<usize>> RecvPacket for F {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
 enum PacketKind {
+    /// Used to check for compatibility between client and server.
+    ///
+    /// - A client sends out an empty packet to a server to request its version.
+    /// - A server, in turn, responds with a [`Packets::Version`] packet.
+    Version,
     /// A part of a reliable packet.
     Part,
     /// The last part of a reliable packet.
@@ -771,7 +825,10 @@ enum PacketKind {
     /// If this packet gets dropped, the receiver would keep the uuid around indefinitely. For this
     /// reason, the receiver also forgets uuids after a sufficiently long timeout.
     Done,
-    /// Not a packet kind, but instead marks the start of the first [`UpdatePacket`].
+    /// Not a packet kind, but instead marks the start of the first update packet.
+    ///
+    /// - [`Packets::ServerUpdate`] when sent by a server to a client
+    /// - [`Packets::ClientUpdate`] when sent by a client to a server
     FirstUpdate,
 }
 
