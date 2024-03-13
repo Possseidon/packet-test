@@ -9,11 +9,11 @@ use uuid::Uuid;
 
 use crate::packet::{
     receive::ReceivedPacket, ArchivedClientConnectionPacket, ClientConnectionPacket,
-    DefaultPackets, PacketBuffers, PacketHandling, PacketId, Packets, ServerConfig,
-    ServerConnectionPacket, ServerPacketBuffers, PACKET_BUFFER_SIZE,
+    DefaultPackets, NonBlocking, PacketBuffers, PacketHandling, PacketId, PacketKind, Packets,
+    ServerConfig, ServerConnectionPacket, ServerPacketBuffers, VersionPacket, PACKET_BUFFER_SIZE,
 };
 
-use super::{ConnectionHandler, DefaultConnectionHandler, HandlerError};
+use super::{ConnectionHandler, DefaultConnectionHandler, HandlerError, NonBlockingUdpSocket};
 
 pub struct Server<P: Packets = DefaultPackets> {
     config: ServerConfig,
@@ -46,7 +46,7 @@ impl<P: Packets> Server<P> {
         self.connections
             .iter_mut()
             .flatten()
-            .find(|connection| connection.addr == client_addr)
+            .find(|connection| connection.client_addr == client_addr)
             .map(|connection| Client {
                 socket: &self.socket,
                 connection,
@@ -68,7 +68,7 @@ impl<P: Packets> Server<P> {
             let result = connection.buffers.update(
                 self.config.connection.timeout,
                 self.config.connection.resend_delay,
-                |buf| self.socket.send_to(buf, connection.addr),
+                NonBlockingUdpSocket::new(&self.socket, connection.client_addr),
             );
             match result {
                 Ok(()) => {}
@@ -78,7 +78,7 @@ impl<P: Packets> Server<P> {
                         break;
                     }
                     handler.error(HandlerError::Send {
-                        peer_addr: connection.addr,
+                        peer_addr: connection.client_addr,
                         error,
                     });
                     *connection_entry = None;
@@ -86,10 +86,10 @@ impl<P: Packets> Server<P> {
             }
         }
 
-        let mut buf = [0; PACKET_BUFFER_SIZE];
+        let mut packet_buf = [0; PACKET_BUFFER_SIZE];
         loop {
-            let (buf, client_addr) = match self.socket.recv_from(&mut buf) {
-                Ok((size, addr)) => (&buf[..size], addr),
+            let (buf, client_addr) = match self.socket.recv_from(&mut packet_buf) {
+                Ok((size, addr)) => (&packet_buf[..size], addr),
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     break;
                 }
@@ -102,7 +102,7 @@ impl<P: Packets> Server<P> {
             let connection_entry = self.connections.iter_mut().find(|connection| {
                 connection
                     .as_ref()
-                    .is_some_and(|connection| connection.addr == client_addr)
+                    .is_some_and(|connection| connection.client_addr == client_addr)
             });
 
             let connection_entry = if let Some(connection_entry) = connection_entry {
@@ -111,7 +111,7 @@ impl<P: Packets> Server<P> {
                 let now = Instant::now();
                 self.connections.push(Some(Connection {
                     connected: false,
-                    addr: client_addr,
+                    client_addr,
                     ping_id: Uuid::new_v4(),
                     ping: now,
                     pong: None,
@@ -120,11 +120,26 @@ impl<P: Packets> Server<P> {
                 self.connections.last_mut().unwrap()
             };
 
+            if buf.is_empty() {
+                // empty packet corresponds to a version query
+                packet_buf[0] = PacketKind::Version.into();
+                let version_len = handler.version(client_addr).write(&mut packet_buf[1..]);
+                let buf = &packet_buf[..version_len + 1];
+                if let Err(error) = NonBlockingUdpSocket::new(&self.socket, client_addr).send(buf) {
+                    handler.error(HandlerError::Send {
+                        peer_addr: client_addr,
+                        error,
+                    });
+                }
+                // ignore if it wasn't sent because the socket would have blocked
+                continue;
+            }
+
             let connection = connection_entry.as_mut().unwrap();
 
             let packet_handling = connection
                 .buffers
-                .handle(buf, |buf| self.socket.send_to(buf, client_addr));
+                .handle(buf, NonBlockingUdpSocket::new(&self.socket, client_addr));
 
             let packet_handling = match packet_handling {
                 Ok(packet_handling) => packet_handling,
@@ -160,7 +175,7 @@ impl<P: Packets> Server<P> {
                                 let result = connection.buffers.send(
                                     ServerConnectionPacket::Status(status),
                                     self.config.connection.background_serialization_threshold,
-                                    |buf| self.socket.send_to(buf, client_addr),
+                                    NonBlockingUdpSocket::new(&self.socket, client_addr),
                                 );
                                 if let Err(error) = result {
                                     handler.error(HandlerError::Send {
@@ -186,7 +201,10 @@ impl<P: Packets> Server<P> {
                                                 self.config
                                                     .connection
                                                     .background_serialization_threshold,
-                                                |buf| self.socket.send_to(buf, client_addr),
+                                                NonBlockingUdpSocket::new(
+                                                    &self.socket,
+                                                    client_addr,
+                                                ),
                                             );
                                             if let Err(error) = result {
                                                 handler.error(HandlerError::Send {
@@ -202,7 +220,10 @@ impl<P: Packets> Server<P> {
                                                 self.config
                                                     .connection
                                                     .background_serialization_threshold,
-                                                |buf| self.socket.send_to(buf, client_addr),
+                                                NonBlockingUdpSocket::new(
+                                                    &self.socket,
+                                                    client_addr,
+                                                ),
                                             );
                                             if let Err(error) = result {
                                                 handler.error(HandlerError::Send {
@@ -261,6 +282,8 @@ impl<P: Packets> std::fmt::Debug for Server<P> {
 }
 
 pub trait ServerHandler<P: Packets>: ConnectionHandler {
+    fn version(&mut self, _client_addr: SocketAddr) -> P::Version;
+
     fn query(
         &mut self,
         _client_addr: SocketAddr,
@@ -284,9 +307,14 @@ pub trait ServerHandler<P: Packets>: ConnectionHandler {
 
 impl<P: Packets> ServerHandler<P> for DefaultConnectionHandler
 where
+    <P as Packets>::Version: Default,
     <P as Packets>::Status: Default,
     <P as Packets>::Accept: Default,
 {
+    fn version(&mut self, _client_addr: SocketAddr) -> <P as Packets>::Version {
+        Default::default()
+    }
+
     fn query(
         &mut self,
         _client_addr: SocketAddr,
@@ -331,7 +359,7 @@ impl<'a, P: Packets> Client<'a, P> {
         self.connection
             .buffers
             .send(packet, self.background_serialization_threshold, {
-                |buf| self.socket.send_to(buf, self.connection.addr)
+                NonBlockingUdpSocket::new(self.socket, self.connection.client_addr)
             })
     }
 
@@ -348,7 +376,7 @@ impl<'a, P: Packets> Client<'a, P> {
 struct Connection<P: Packets> {
     /// Connections
     connected: bool,
-    addr: SocketAddr,
+    client_addr: SocketAddr,
     ping_id: Uuid,
     ping: Instant,
     pong: Option<Instant>,
@@ -361,7 +389,7 @@ struct Connection<P: Packets> {
 impl<P: Packets> std::fmt::Debug for Connection<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection")
-            .field("addr", &self.addr)
+            .field("client_addr", &self.client_addr)
             .field("ping_id", &self.ping_id)
             .field("ping", &self.ping)
             .field("pong", &self.pong)

@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    io::{self, ErrorKind},
+    io,
     iter::zip,
     mem::{replace, size_of},
     ops::{Deref, DerefMut},
@@ -11,8 +11,8 @@ use std::{
 use rkyv::AlignedBytes;
 
 use super::{
-    serialize::SerializedPacket, BatchSize, BufferIndex, NonZeroBatchSize, PacketId, PacketKind,
-    SendPacket, SeqIndex, SeqIndexAckedBeforeSent, PACKET_BUFFER_SIZE, PART_PACKET_PAYLOAD_SIZE,
+    serialize::SerializedPacket, BatchSize, BufferIndex, NonBlocking, NonZeroBatchSize, PacketId,
+    PacketKind, SeqIndex, SeqIndexAckedBeforeSent, PACKET_BUFFER_SIZE, PART_PACKET_PAYLOAD_SIZE,
 };
 
 /// Stores packets of any size so that they can be sent reliably.
@@ -39,12 +39,11 @@ pub(crate) struct PacketOut {
 impl PacketOut {
     pub(crate) fn send(
         packet: SerializedPacket,
-        send: impl SendPacket,
+        socket: impl NonBlocking,
         initial_batch_size: NonZeroBatchSize,
     ) -> io::Result<Self> {
         let mut packet_queue = PacketQueue::new(packet);
-        let (last_batch_size, _would_block) =
-            packet_queue.send_unacked(initial_batch_size, send)?;
+        let (last_batch_size, _) = packet_queue.send_unacked(initial_batch_size, socket)?;
         let now = Instant::now();
         Ok(Self {
             packet_queue,
@@ -75,7 +74,7 @@ impl PacketOut {
         &mut self,
         id: PacketId,
         resend_delay: Duration,
-        send: impl SendPacket,
+        socket: impl NonBlocking,
     ) -> io::Result<bool> {
         if self.last_send.elapsed() < resend_delay {
             return Ok(false);
@@ -84,18 +83,9 @@ impl PacketOut {
         self.batch_size =
             Self::balance_batch_size(self.batch_size, self.last_batch_acks, self.last_batch_size);
 
-        match self.packet_queue.send_unacked(self.batch_size, &send)? {
-            (0, false) => {
-                if let Err(error) = done(id, send) {
-                    if error.kind() == ErrorKind::WouldBlock {
-                        // could not send out done, try again later
-                        return Ok(false);
-                    }
-                    Err(error)?
-                }
-                Ok(true)
-            }
-            (count, _would_block) => {
+        match self.packet_queue.send_unacked(self.batch_size, socket)? {
+            (0, true) => Ok(done(id, socket)?),
+            (count, _) => {
                 self.last_batch_size = count;
                 self.last_batch_acks = 0;
                 self.last_send = Instant::now();
@@ -199,28 +189,25 @@ impl PacketQueue {
 
     /// Sends up to `batch_size` packets.
     ///
-    /// Returns the number of packets that were actually sent and if the send function would have
-    /// blocked at some point.
+    /// Returns the number of packets that were actually sent and `true` if non of the send calls
+    /// would have blocked.
     ///
-    /// `Ok((0, false))` means, all packets are acked.
+    /// Therefore, `Ok((0, true))` means that all packets are acked.
     fn send_unacked(
         &mut self,
         batch_size: NonZeroBatchSize,
-        send: impl SendPacket,
+        socket: impl NonBlocking,
     ) -> io::Result<(BatchSize, bool)> {
         let mut count = 0;
         println!("Sending unacked packets...");
         for buf in self.unacked(batch_size.get().into()) {
             println!("  {} bytes", buf.len());
-            if let Err(error) = send(buf) {
-                if error.kind() == ErrorKind::WouldBlock {
-                    return Ok((count, true));
-                }
-                Err(error)?
+            if !socket.send(buf)? {
+                return Ok((count, false));
             }
             count += 1;
         }
-        Ok((count, false))
+        Ok((count, true))
     }
 
     fn unacked(&mut self, count: usize) -> impl Iterator<Item = &[u8]> {
@@ -383,10 +370,9 @@ where
     }
 }
 
-fn done(id: PacketId, send: impl SendPacket) -> io::Result<()> {
+fn done(id: PacketId, socket: impl NonBlocking) -> io::Result<bool> {
     let mut done = [0; 17];
     done[0] = PacketKind::Done as u8;
     done[1..17].copy_from_slice(id.as_bytes());
-    send(&done)?;
-    Ok(())
+    socket.send(&done)
 }

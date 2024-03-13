@@ -159,6 +159,7 @@ pub trait VersionPacket: Sized {
 }
 
 /// Does not contain any version information but only accepts empty packets in response as well.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NoVersion;
 
 impl VersionPacket for NoVersion {
@@ -254,7 +255,7 @@ impl UpdatePacket for NoPacket {
 pub struct ConnectionConfig {
     /// How long to wait for a packet before disconnecting.
     pub timeout: Duration,
-    /// How long to wait for an ack before the packet is resent.
+    /// How long to wait before trying to send a packet again.
     pub resend_delay: Duration,
     /// How many packets are sent at once initially for new connections.
     ///
@@ -336,29 +337,33 @@ impl<S: Packet, R: Packet> PacketBuffers<S, R> {
         &mut self,
         packet: S,
         background_serialization_threshold: usize,
-        send: impl SendPacket,
+        socket: impl NonBlocking,
     ) -> io::Result<PacketId> {
         self.send_buffer
-            .send(packet, background_serialization_threshold, send)
+            .send(packet, background_serialization_threshold, socket)
     }
 
     pub(crate) fn update(
         &mut self,
         timeout: Duration,
         resend_delay: Duration,
-        send: impl SendPacket,
+        socket: impl NonBlocking,
     ) -> io::Result<()> {
         self.timeout_packets(timeout);
-        self.send_pending(resend_delay, send)?;
+        self.send_pending(resend_delay, socket)?;
         Ok(())
     }
 
     pub(crate) fn handle<'a>(
         &'a mut self,
         buf: &'a [u8],
-        send: impl SendPacket,
+        socket: impl NonBlocking,
     ) -> Result<PacketHandling<'a>, HandlePacketError> {
-        match self.receive_buffer.handle(buf, send)? {
+        if buf.is_empty() {
+            return Err(HandlePacketError::Empty);
+        }
+
+        match self.receive_buffer.handle(buf, socket)? {
             ReceivedPacketHandling::Ack(received) => return Ok(PacketHandling::Received(received)),
             ReceivedPacketHandling::Done => return Ok(PacketHandling::Done),
             ReceivedPacketHandling::Unhandled => {}
@@ -371,11 +376,11 @@ impl<S: Packet, R: Packet> PacketBuffers<S, R> {
 
         // TODO: Handle update packets
 
-        Err(HandlePacketError::UnexpectedKind(42)) // TODO: extract kind and use it
+        Err(HandlePacketError::UnexpectedKind(buf[0]))
     }
 
-    fn send_pending(&mut self, resend_delay: Duration, send: impl SendPacket) -> io::Result<()> {
-        self.send_buffer.send_pending(resend_delay, send)
+    fn send_pending(&mut self, resend_delay: Duration, socket: impl NonBlocking) -> io::Result<()> {
+        self.send_buffer.send_pending(resend_delay, socket)
     }
 
     fn timeout_packets(&mut self, timeout: Duration) {
@@ -464,7 +469,7 @@ impl SendPacketBuffer {
         &mut self,
         packet: impl Packet,
         background_serialization_threshold: usize,
-        send: impl SendPacket,
+        socket: impl NonBlocking,
     ) -> io::Result<PacketId> {
         let id = PacketId::new();
         println!("Sending {id:?}");
@@ -472,7 +477,7 @@ impl SendPacketBuffer {
             id,
             PacketOut::send(
                 serialize_packet(id, background_serialization_threshold, packet),
-                send,
+                socket,
                 self.batch_size,
             )?,
         );
@@ -480,7 +485,7 @@ impl SendPacketBuffer {
     }
 
     /// Sends out still pending packet parts.
-    fn send_pending(&mut self, resend_delay: Duration, send: impl SendPacket) -> io::Result<()> {
+    fn send_pending(&mut self, resend_delay: Duration, socket: impl NonBlocking) -> io::Result<()> {
         let mut batch_size: usize = 0;
         let mut count: usize = 0;
         let mut result = Ok(());
@@ -490,8 +495,8 @@ impl SendPacketBuffer {
             if result.is_err() {
                 return true;
             }
-            match packet.send_pending(*id, resend_delay, &send) {
-                Ok(fully_acked) => !fully_acked,
+            match packet.send_pending(*id, resend_delay, socket) {
+                Ok(done) => !done,
                 Err(error) => {
                     result = Err(error);
                     true
@@ -597,7 +602,7 @@ impl ReceivePacketBuffer {
     fn handle<'a>(
         &'a mut self,
         buf: &'a [u8],
-        send: impl SendPacket,
+        socket: impl NonBlocking,
     ) -> Result<ReceivedPacketHandling<'a>, HandlePacketError> {
         let kind = buf.first().ok_or(HandlePacketError::Empty)?;
         if let Ok(kind) = PacketKind::try_from(*kind) {
@@ -631,7 +636,7 @@ impl ReceivePacketBuffer {
                         id()?,
                         seq_index,
                         payload,
-                        send,
+                        socket,
                     )?))
                 }
                 PacketKind::Done => {
@@ -654,7 +659,7 @@ impl ReceivePacketBuffer {
         id: PacketId,
         seq_index: SeqIndex,
         payload: &'a [u8],
-        send: impl SendPacket,
+        socket: impl NonBlocking,
     ) -> Result<ReceivedPacket<'a>, PacketReceiveError> {
         if last && seq_index == 0 {
             match self.packets.entry(id) {
@@ -663,12 +668,12 @@ impl ReceivePacketBuffer {
                         last_receive: Instant::now(),
                         packet: None,
                     });
-                    ack(id, seq_index, send)?; // TODO: ignore WouldBlock
+                    ack(id, seq_index, socket)?;
                     Ok(ReceivedPacket::Reassembled(payload))
                 }
                 Entry::Occupied(entry) => {
                     if entry.get().packet.is_none() {
-                        ack(id, seq_index, send)?; // TODO: ignore WouldBlock
+                        ack(id, seq_index, socket)?;
                         Ok(ReceivedPacket::Pending { duplicate: true })
                     } else {
                         Err(PacketReceiveError {
@@ -685,7 +690,7 @@ impl ReceivePacketBuffer {
             });
             if let Some(packet) = &mut packet.packet {
                 let received_packet = packet.receive(last, seq_index, payload);
-                ack(id, seq_index, send)?; // TODO: ignore WouldBlock
+                ack(id, seq_index, socket)?;
                 Ok(received_packet)
             } else {
                 Err(PacketReceiveError {
@@ -797,15 +802,17 @@ struct PacketIn {
     packet: Option<ReassembledPacket>,
 }
 
-pub(crate) trait SendPacket: Fn(&[u8]) -> io::Result<usize> {}
-impl<F: Fn(&[u8]) -> io::Result<usize>> SendPacket for F {}
-
-pub(crate) trait RecvPacket: Fn(&mut [u8]) -> io::Result<usize> {}
-impl<F: Fn(&mut [u8]) -> io::Result<usize>> RecvPacket for F {}
+/// A non-blocking socket that can send data.
+pub(crate) trait NonBlocking: Copy {
+    /// Returns `false` if it wasn't sent because the socket would block.
+    ///
+    /// This allows propagating errors using `?`, since "would block" is no longer treated as one.
+    fn send(self, buf: &[u8]) -> io::Result<bool>;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
-enum PacketKind {
+pub(crate) enum PacketKind {
     /// Used to check for compatibility between client and server.
     ///
     /// - A client sends out an empty packet to a server to request its version.
@@ -845,14 +852,22 @@ const PART_PACKET_PAYLOAD_SIZE: NonZeroUsize = {
 /// Can store a single sequence index.
 type SeqIndex = u32;
 
-fn ack(id: PacketId, seq_index: SeqIndex, send: impl SendPacket) -> Result<(), PacketReceiveError> {
+fn ack(
+    id: PacketId,
+    seq_index: SeqIndex,
+    socket: impl NonBlocking,
+) -> Result<(), PacketReceiveError> {
     let mut ack = [0; 17 + size_of::<SeqIndex>()];
     ack[0] = PacketKind::Ack as u8;
     ack[1..17].copy_from_slice(id.as_bytes());
     ack[17..17 + size_of::<SeqIndex>()].copy_from_slice(&seq_index.to_le_bytes());
-    send(&ack).map_err(|error| PacketReceiveError {
+    socket.send(&ack).map_err(|error| PacketReceiveError {
         id,
         kind: error.into(),
     })?;
+    // Ignore if it would block; it's more likely that a packet gets dropped, which results in the
+    // same situation, except that it's not possible to detect if a packet was dropped.
+    // Currently acks are only sent out in response to a "receive" packet, but blocking acks would
+    // have to be retried periodically, which complicates things quite a bit with no real benefit.
     Ok(())
 }

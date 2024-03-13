@@ -72,11 +72,11 @@ impl ReassembledPacket {
 
 /// A part of a packet was received.
 pub(crate) enum ReceivedPacket<'a> {
-    /// A part of the packet was received, but the packet is not fully assembled.
+    /// A part of the packet was received, but the packet is not fully reassembled.
     Pending {
         /// Whether this packet was already received.
         duplicate: bool,
     },
-    /// The last part was acked and the packet is fully assembled.
+    /// The last part was received and the packet is fully reassembled.
     Reassembled(&'a [u8]),
 }

@@ -11,14 +11,35 @@
 // };
 // use uuid::Uuid;
 
-use std::{net::Ipv4Addr, time::Duration};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use anyhow::Result;
-use packet_test::net::{client::Client, DefaultConnectionHandler};
+use packet_test::net::{
+    client::{Client, Compatibility},
+    DefaultConnectionHandler,
+};
 
 fn main() -> Result<()> {
     let mut client = <Client>::new()?;
-    client.connect((Ipv4Addr::LOCALHOST, 42069), ())?;
+
+    let server_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 42069));
+    client.listen(server_addr)?;
+    while let Some(Compatibility::Pending) = client.compatibility(server_addr) {
+        client.update(&mut DefaultConnectionHandler);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Some(Compatibility::Incompatible(error)) = client.compatibility(server_addr) {
+        println!("incompatible: {error}");
+        return Ok(());
+    }
+
+    println!("connecting...");
+    client.connect(server_addr, ())?;
+
     loop {
         client.update(&mut DefaultConnectionHandler);
         std::thread::sleep(Duration::from_millis(100));
