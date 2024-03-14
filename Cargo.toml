@@ -1,17 +1,10 @@
 [package]
-name = "packet-test"
+name = "ultinet"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1.0.80"
-# bevy = { version = "0.13.0", default-features = false, features = [
-#     "bevy_asset",
-#     "bevy_core_pipeline",
-#     "bevy_render",
-#     "bevy_sprite",
-#     "bevy_winit",
-# ] }
 bitvec = "1.0.1"
 num_enum = "0.7.2"
 rkyv = { version = "0.7.44", features = ["validation", "archive_le"] }
