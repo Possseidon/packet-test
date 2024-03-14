@@ -2,7 +2,7 @@
 
 **TODO**: *Badges*
 
-An server-client networking library powered by [rkyv](https://github.com/rkyv/rkyv).
+A server-client networking library powered by [rkyv](https://github.com/rkyv/rkyv).
 
 ## Features
 
