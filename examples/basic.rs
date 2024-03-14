@@ -1,12 +1,32 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+    env::args,
+    net::{Ipv4Addr, SocketAddr},
+};
 
-use anyhow::Result;
-use packet_test::net::{
+use anyhow::{bail, Result};
+use ultinet::net::{
     client::{Client, Compatibility},
+    server::Server,
     BasicLogConnectionHandler, DefaultConnectionHandler,
 };
 
 fn main() -> Result<()> {
+    match args().nth(1).as_deref() {
+        Some("server") => server(),
+        Some("client") => client(),
+        _ => bail!("expected 'server' or 'client'"),
+    }
+}
+
+fn server() -> Result<()> {
+    let mut server = <Server>::host((Ipv4Addr::LOCALHOST, 42069))?;
+    loop {
+        server.update(&mut BasicLogConnectionHandler);
+        // std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn client() -> Result<()> {
     let mut client = <Client>::new()?;
 
     let server_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 42069));
