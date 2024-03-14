@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod net;
 pub mod packet;
 

@@ -42,7 +42,7 @@ impl ReassembledPacket {
                 .resize(chunk_index_with_offset + 1, false);
         }
         if self.received_chunks.replace(chunk_index_with_offset, true) {
-            return ReceivedPacket::Pending { duplicate: true };
+            return ReceivedPacket::Duplicate;
         }
         let first_pending = self
             .received_chunks
@@ -65,7 +65,7 @@ impl ReassembledPacket {
             ReceivedPacket::Reassembled(&self.payload)
         } else {
             self.received_count += 1;
-            ReceivedPacket::Pending { duplicate: false }
+            ReceivedPacket::Pending
         }
     }
 }
@@ -73,10 +73,11 @@ impl ReassembledPacket {
 /// A part of a packet was received.
 pub(crate) enum ReceivedPacket<'a> {
     /// A part of the packet was received, but the packet is not fully reassembled.
-    Pending {
-        /// Whether this packet was already received.
-        duplicate: bool,
-    },
+    Pending,
+    /// This packet was already received and can be ignored.
+    ///
+    /// The packet might still be pending or it might have been reassembled already.
+    Duplicate,
     /// The last part was received and the packet is fully reassembled.
     Reassembled(&'a [u8]),
 }

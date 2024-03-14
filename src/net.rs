@@ -11,41 +11,116 @@ use thiserror::Error;
 
 use crate::packet::{HandlePacketError, NonBlocking};
 
+/// Allows listening for the underlying packet parts as well as deal with errors.
 pub trait ConnectionHandler {
-    fn pending(&mut self, _peer_addr: SocketAddr, _duplicate: bool) {}
-    fn done(&mut self, _peer_addr: SocketAddr) {}
-    fn ack(&mut self, _peer_addr: SocketAddr, _duplicate: bool) {}
+    /// An update for an outgoing or incoming packet was received.
+    ///
+    /// The main use for this is to gather statistics about a connection (how man total packets were
+    /// sent/received, how many were duplicates, etc...).
+    ///
+    /// If this information is not needed, this can safely be ignored.
+    fn raw_packet(&mut self, packet: RawPacket) {
+        _ = packet;
+    }
 
-    fn error(&mut self, _error: HandlerError) {}
+    /// Reports errors like packet validation failure, networking IO errors, etc...
+    ///
+    /// While these can be safely ignored, it probably doesn't hurt to at the very least log them.
+    fn error(&mut self, error: HandlerError) {
+        _ = error;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum RawPacket {
+    /// A part of a packet was received.
+    Part {
+        /// The sender of this packet part.
+        sender_addr: SocketAddr,
+        /// Information about the received part.
+        info: PartInfo,
+    },
+    /// The sender will no longer send updates for this packet.
+    ///
+    /// Either because the packet was fully acked by the receiver, or because the sender is no
+    /// longer interested in the client receiving this packet and canceled it.
+    Done {
+        /// The sender of this packet part.
+        sender_addr: SocketAddr,
+        /// Whether the receiver was aware of this packets existence.
+        ///
+        /// This can be `false` if the receiver never received any of the part packets before the
+        /// sender canceled the packet altogether.
+        known_packet: bool,
+    },
+    /// A part of a sent packet was acked by its receiver.
+    Ack {
+        /// The receiver who acked this packet part.
+        receiver_addr: SocketAddr,
+        /// Whether the receiver has already acked this packet before, which can happen, if e.g. the
+        /// sender had resent this part even though the client received it the first time and just
+        /// acked it very late.
+        duplicate: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum PartInfo {
+    /// A new part was received, but the packet is not yet fully reassembled.
+    Pending,
+    /// This was the last packet that was required to fully reassemble the packet.
+    Reassembled,
+    /// This part was already received before, which can happen if the corresponding `ack` did
+    /// not reach the sender.
+    ///
+    /// Can still happen even after the packet has been reassembled.
+    Duplicate,
 }
 
 #[derive(Debug, Error)]
 pub enum HandlerError {
     #[error("recv failed: {0}")]
     Recv(io::Error),
-    #[error("send to {peer_addr} failed: {error}")]
+    #[error("send to {receiver_addr} failed: {error}")]
     Send {
-        peer_addr: SocketAddr,
+        receiver_addr: SocketAddr,
         error: io::Error,
     },
-    #[error("received invalid packet from {peer_addr}: {error:?}")]
+    #[error("packet from {sender_addr} failed validation: {error}")]
     PacketValidation {
-        peer_addr: SocketAddr,
+        sender_addr: SocketAddr,
         error: Box<dyn Error>,
     },
-    #[error("error handling packet from {peer_addr}: {error:?}")]
+    #[error("packet from {sender_addr} could not be handled: {error:?}")]
     Handle {
-        peer_addr: SocketAddr,
+        sender_addr: SocketAddr,
         error: HandlePacketError,
     },
+    #[error("{peer_addr} timed out")]
+    Timeout { peer_addr: SocketAddr },
 }
 
 /// A connection handler that simply ignores all packets.
 ///
 /// For servers, returns a default status and accepts all clients.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct DefaultConnectionHandler;
 
 impl ConnectionHandler for DefaultConnectionHandler {}
+
+/// A connection handler that logs all events to `stdout`.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub struct BasicLogConnectionHandler;
+
+impl ConnectionHandler for BasicLogConnectionHandler {
+    fn raw_packet(&mut self, packet: RawPacket) {
+        println!("{packet:?}");
+    }
+
+    fn error(&mut self, error: HandlerError) {
+        println!("{error:?}");
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct NonBlockingUdpSocket<'a> {

@@ -5,6 +5,7 @@ use std::{
 };
 
 use rkyv::{check_archived_root, validation::validators::DefaultValidator, Archive, CheckBytes};
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::packet::{
@@ -13,7 +14,10 @@ use crate::packet::{
     ServerConfig, ServerConnectionPacket, ServerPacketBuffers, VersionPacket, PACKET_BUFFER_SIZE,
 };
 
-use super::{ConnectionHandler, DefaultConnectionHandler, HandlerError, NonBlockingUdpSocket};
+use super::{
+    BasicLogConnectionHandler, ConnectionHandler, DefaultConnectionHandler, HandlerError,
+    NonBlockingUdpSocket, PartInfo, RawPacket,
+};
 
 pub struct Server<P: Packets = DefaultPackets> {
     config: ServerConfig,
@@ -78,7 +82,7 @@ impl<P: Packets> Server<P> {
                         break;
                     }
                     handler.error(HandlerError::Send {
-                        peer_addr: connection.client_addr,
+                        receiver_addr: connection.client_addr,
                         error,
                     });
                     *connection_entry = None;
@@ -123,11 +127,11 @@ impl<P: Packets> Server<P> {
             if buf.is_empty() {
                 // empty packet corresponds to a version query
                 packet_buf[0] = PacketKind::Version.into();
-                let version_len = handler.version(client_addr).write(&mut packet_buf[1..]);
+                let version_len = handler.version().write(&mut packet_buf[1..]);
                 let buf = &packet_buf[..version_len + 1];
                 if let Err(error) = NonBlockingUdpSocket::new(&self.socket, client_addr).send(buf) {
                     handler.error(HandlerError::Send {
-                        peer_addr: client_addr,
+                        receiver_addr: client_addr,
                         error,
                     });
                 }
@@ -145,7 +149,7 @@ impl<P: Packets> Server<P> {
                 Ok(packet_handling) => packet_handling,
                 Err(error) => {
                     handler.error(HandlerError::Handle {
-                        peer_addr: client_addr,
+                        sender_addr: client_addr,
                         error,
                     });
                     continue;
@@ -154,16 +158,30 @@ impl<P: Packets> Server<P> {
 
             match packet_handling {
                 PacketHandling::Received(ack) => match ack {
-                    ReceivedPacket::Pending { duplicate } => {
-                        handler.pending(client_addr, duplicate);
+                    ReceivedPacket::Pending => {
+                        handler.raw_packet(RawPacket::Part {
+                            sender_addr: client_addr,
+                            info: PartInfo::Pending,
+                        });
+                    }
+                    ReceivedPacket::Duplicate => {
+                        handler.raw_packet(RawPacket::Part {
+                            sender_addr: client_addr,
+                            info: PartInfo::Duplicate,
+                        });
                     }
                     ReceivedPacket::Reassembled(bytes) => {
+                        handler.raw_packet(RawPacket::Part {
+                            sender_addr: client_addr,
+                            info: PartInfo::Reassembled,
+                        });
+
                         let packet = check_archived_root::<ClientConnectionPacket<P>>(bytes);
                         let packet = match packet {
                             Ok(packet) => packet,
                             Err(error) => {
                                 handler.error(HandlerError::PacketValidation {
-                                    peer_addr: client_addr,
+                                    sender_addr: client_addr,
                                     error: Box::new(error),
                                 });
                                 continue;
@@ -179,7 +197,7 @@ impl<P: Packets> Server<P> {
                                 );
                                 if let Err(error) = result {
                                     handler.error(HandlerError::Send {
-                                        peer_addr: client_addr,
+                                        receiver_addr: client_addr,
                                         error,
                                     });
                                 }
@@ -191,7 +209,7 @@ impl<P: Packets> Server<P> {
                                 if connection.connected {
                                     handler.unexpected(
                                         client_addr,
-                                        UnexpectedClientPacket::Connect(connect),
+                                        UnexpectedClientPacket::AlreadyConnected,
                                     );
                                 } else {
                                     match handler.connect(client_addr, connect) {
@@ -208,7 +226,7 @@ impl<P: Packets> Server<P> {
                                             );
                                             if let Err(error) = result {
                                                 handler.error(HandlerError::Send {
-                                                    peer_addr: client_addr,
+                                                    receiver_addr: client_addr,
                                                     error,
                                                 })
                                             }
@@ -227,7 +245,7 @@ impl<P: Packets> Server<P> {
                                             );
                                             if let Err(error) = result {
                                                 handler.error(HandlerError::Send {
-                                                    peer_addr: client_addr,
+                                                    receiver_addr: client_addr,
                                                     error,
                                                 })
                                             }
@@ -242,7 +260,7 @@ impl<P: Packets> Server<P> {
                                 } else {
                                     handler.unexpected(
                                         client_addr,
-                                        UnexpectedClientPacket::Disconnect(disconnect),
+                                        UnexpectedClientPacket::NotConnected,
                                     );
                                 }
                                 *connection_entry = None;
@@ -253,18 +271,24 @@ impl<P: Packets> Server<P> {
                                 } else {
                                     handler.unexpected(
                                         client_addr,
-                                        UnexpectedClientPacket::Packet(packet),
+                                        UnexpectedClientPacket::NotConnected,
                                     )
                                 }
                             }
                         }
                     }
                 },
-                PacketHandling::Done => {
-                    handler.done(client_addr);
+                PacketHandling::Done { known_packet } => {
+                    handler.raw_packet(RawPacket::Done {
+                        sender_addr: client_addr,
+                        known_packet,
+                    });
                 }
                 PacketHandling::Ack { duplicate } => {
-                    handler.ack(client_addr, duplicate);
+                    handler.raw_packet(RawPacket::Ack {
+                        receiver_addr: client_addr,
+                        duplicate,
+                    });
                 }
             }
         }
@@ -282,53 +306,103 @@ impl<P: Packets> std::fmt::Debug for Server<P> {
 }
 
 pub trait ServerHandler<P: Packets>: ConnectionHandler {
-    fn version(&mut self, _client_addr: SocketAddr) -> P::Version;
+    /// Returns the version that should be sent to clients.
+    ///
+    /// This depends on the server (and is called for every new request), so that the server can
+    /// send (partial) status information to clients even if they are incompatible.
+    fn version(&mut self) -> P::Version;
+
+    /// Returns the status that should be sent to clients.
+    fn query(
+        &mut self,
+        client_addr: SocketAddr,
+        query: &<P::Query as Archive>::Archived,
+    ) -> P::Status;
+    /// Returns whether the given client is allowed to connect (accept) or not (reject).
+    fn connect(
+        &mut self,
+        client_addr: SocketAddr,
+        connect: &<P::Connect as Archive>::Archived,
+    ) -> Connect<P>;
+    /// Called when a client disconnects on its own.
+    fn disconnect(
+        &mut self,
+        client_addr: SocketAddr,
+        disconect: &<P::Disconnect as Archive>::Archived,
+    ) {
+        _ = (client_addr, disconect);
+    }
+    /// A client sent a packet.
+    fn packet(&mut self, client_addr: SocketAddr, packet: &<P::Client as Archive>::Archived) {
+        _ = (client_addr, packet);
+    }
+
+    /// A client sent an unexpected packet.
+    fn unexpected(&mut self, client_addr: SocketAddr, unexpected: UnexpectedClientPacket) {
+        _ = (client_addr, unexpected);
+    }
+}
+
+impl<P: Packets> ServerHandler<P> for DefaultConnectionHandler
+where
+    P::Version: Default,
+    P::Status: Default,
+    P::Accept: Default,
+{
+    fn version(&mut self) -> P::Version {
+        Default::default()
+    }
 
     fn query(
         &mut self,
         _client_addr: SocketAddr,
         _query: &<P::Query as Archive>::Archived,
-    ) -> P::Status;
+    ) -> P::Status {
+        Default::default()
+    }
+
     fn connect(
         &mut self,
         _client_addr: SocketAddr,
         _connect: &<P::Connect as Archive>::Archived,
-    ) -> Connect<P>;
-    fn disconnect(
-        &mut self,
-        _client_addr: SocketAddr,
-        _disconect: &<P::Disconnect as Archive>::Archived,
-    ) {
+    ) -> Connect<P> {
+        Connect::Accept(Default::default())
     }
-    fn packet(&mut self, _client_addr: SocketAddr, _packet: &<P::Client as Archive>::Archived) {}
-
-    fn unexpected(&mut self, _client_addr: SocketAddr, _unexpected: UnexpectedClientPacket<P>) {}
 }
 
-impl<P: Packets> ServerHandler<P> for DefaultConnectionHandler
+impl<P: Packets> ServerHandler<P> for BasicLogConnectionHandler
 where
-    <P as Packets>::Version: Default,
-    <P as Packets>::Status: Default,
-    <P as Packets>::Accept: Default,
+    P::Version: std::fmt::Debug + Default,
+    <P::Query as Archive>::Archived: std::fmt::Debug,
+    P::Status: std::fmt::Debug + Default,
+    <P::Connect as Archive>::Archived: std::fmt::Debug,
+    P::Accept: Default,
+    Connect<P>: std::fmt::Debug,
 {
-    fn version(&mut self, _client_addr: SocketAddr) -> <P as Packets>::Version {
-        Default::default()
+    fn version(&mut self) -> P::Version {
+        let version = Default::default();
+        println!("{version:?}");
+        version
     }
 
     fn query(
         &mut self,
-        _client_addr: SocketAddr,
-        _query: &<<P as Packets>::Query as Archive>::Archived,
-    ) -> <P as Packets>::Status {
-        Default::default()
+        client_addr: SocketAddr,
+        query: &<P::Query as Archive>::Archived,
+    ) -> P::Status {
+        let status = Default::default();
+        println!("{client_addr} {query:?} {status:?}");
+        status
     }
 
     fn connect(
         &mut self,
-        _client_addr: SocketAddr,
-        _connect: &<<P as Packets>::Connect as Archive>::Archived,
+        client_addr: SocketAddr,
+        connect: &<P::Connect as Archive>::Archived,
     ) -> Connect<P> {
-        Connect::Accept(Default::default())
+        let accept = Connect::Accept(Default::default());
+        println!("{client_addr} {connect:?} {accept:?}");
+        accept
     }
 }
 
@@ -337,10 +411,70 @@ pub enum Connect<P: Packets> {
     Reject(P::Reject),
 }
 
-pub enum UnexpectedClientPacket<'a, P: Packets> {
-    Connect(&'a <P::Connect as Archive>::Archived),
-    Disconnect(&'a <P::Disconnect as Archive>::Archived),
-    Packet(&'a <P::Client as Archive>::Archived),
+impl<P: Packets> Clone for Connect<P>
+where
+    P::Accept: Clone,
+    P::Reject: Clone,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Accept(arg0) => Self::Accept(arg0.clone()),
+            Self::Reject(arg0) => Self::Reject(arg0.clone()),
+        }
+    }
+}
+
+impl<P: Packets> Copy for Connect<P>
+where
+    P::Accept: Copy,
+    P::Reject: Copy,
+{
+}
+
+impl<P: Packets> std::fmt::Debug for Connect<P>
+where
+    P::Accept: std::fmt::Debug,
+    P::Reject: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Accept(arg0) => f.debug_tuple("Accept").field(arg0).finish(),
+            Self::Reject(arg0) => f.debug_tuple("Reject").field(arg0).finish(),
+        }
+    }
+}
+
+impl<P: Packets> PartialEq for Connect<P>
+where
+    P::Accept: PartialEq,
+    P::Reject: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Accept(l0), Self::Accept(r0)) => l0 == r0,
+            (Self::Reject(l0), Self::Reject(r0)) => l0 == r0,
+            _ => false,
+        }
+    }
+}
+
+impl<P: Packets> Eq for Connect<P>
+where
+    P::Accept: Eq,
+    P::Reject: Eq,
+{
+}
+
+#[derive(Debug, Error)]
+pub enum UnexpectedClientPacket {
+    #[error("packet during pending compatible check")]
+    PendingCompatibility,
+    #[error("not connected to this client")]
+    NotConnected,
+    #[error("incompatible with this client")]
+    Incompatible,
+    #[error("already connected to this client")]
+    AlreadyConnected,
 }
 
 pub struct Client<'a, P: Packets> {

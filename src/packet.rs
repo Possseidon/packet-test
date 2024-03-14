@@ -118,7 +118,7 @@ impl<T: Serialize<VecPacketSerializer> + Serialize<ChannelPacketSerializer> + Se
 }
 
 /// Server packets for dealing with client connections.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Archive, Serialize)]
 #[archive(check_bytes)]
 pub enum ServerConnectionPacket<P: Packets> {
     Status(P::Status),
@@ -129,7 +129,7 @@ pub enum ServerConnectionPacket<P: Packets> {
 }
 
 /// Client packets for establishing a server connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Archive, Serialize)]
 #[archive(check_bytes)]
 pub enum ClientConnectionPacket<P: Packets> {
     Query(P::Query),
@@ -159,7 +159,7 @@ pub trait VersionPacket: Sized {
 }
 
 /// Does not contain any version information but only accepts empty packets in response as well.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct NoVersion;
 
 impl VersionPacket for NoVersion {
@@ -198,7 +198,7 @@ pub trait UpdatePacket: Sized {
     fn read(buf: &[u8]) -> Result<Self, Self::ReadError>;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum NoPacket {}
 
 impl Archive for NoPacket {
@@ -216,7 +216,7 @@ impl<S: Fallible + ?Sized> Serialize<S> for NoPacket {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum ArchivedNoPacket {}
 
 impl<C: ?Sized> CheckBytes<C> for ArchivedNoPacket {
@@ -251,7 +251,7 @@ impl UpdatePacket for NoPacket {
 }
 
 /// Connection related configuration for both server and client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct ConnectionConfig {
     /// How long to wait for a packet before disconnecting.
     pub timeout: Duration,
@@ -279,7 +279,7 @@ impl Default for ConnectionConfig {
 }
 
 /// Server specific configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct ServerConfig {
     pub connection: ConnectionConfig,
     /// How long to wait between each ping.
@@ -365,7 +365,9 @@ impl<S: Packet, R: Packet> PacketBuffers<S, R> {
 
         match self.receive_buffer.handle(buf, socket)? {
             ReceivedPacketHandling::Ack(received) => return Ok(PacketHandling::Received(received)),
-            ReceivedPacketHandling::Done => return Ok(PacketHandling::Done),
+            ReceivedPacketHandling::Done { known_packet } => {
+                return Ok(PacketHandling::Done { known_packet })
+            }
             ReceivedPacketHandling::Unhandled => {}
         }
 
@@ -401,8 +403,8 @@ impl<S: Packet, R: Packet> std::fmt::Debug for PacketBuffers<S, R> {
 pub(crate) enum PacketHandling<'a> {
     /// A part of a packet was received.
     Received(ReceivedPacket<'a>),
-    /// The sender is aware that all packets have been received, so the receiver can forget it.
-    Done,
+    /// The sender will stop sending parts for this packet.
+    Done { known_packet: bool },
     /// A part of a sent packet was acked by the receiver.
     Ack { duplicate: bool },
 }
@@ -472,7 +474,6 @@ impl SendPacketBuffer {
         socket: impl NonBlocking,
     ) -> io::Result<PacketId> {
         let id = PacketId::new();
-        println!("Sending {id:?}");
         self.packets.insert(
             id,
             PacketOut::send(
@@ -543,7 +544,7 @@ impl SendPacketBuffer {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum SentPacketHandling {
     /// A sent out packet has been acked.
     Ack {
@@ -639,10 +640,9 @@ impl ReceivePacketBuffer {
                         socket,
                     )?))
                 }
-                PacketKind::Done => {
-                    self.done(id()?)?;
-                    Ok(ReceivedPacketHandling::Done)
-                }
+                PacketKind::Done => Ok(ReceivedPacketHandling::Done {
+                    known_packet: self.done(id()?),
+                }),
                 PacketKind::Version | PacketKind::Ack | PacketKind::FirstUpdate => {
                     Ok(ReceivedPacketHandling::Unhandled)
                 }
@@ -674,7 +674,7 @@ impl ReceivePacketBuffer {
                 Entry::Occupied(entry) => {
                     if entry.get().packet.is_none() {
                         ack(id, seq_index, socket)?;
-                        Ok(ReceivedPacket::Pending { duplicate: true })
+                        Ok(ReceivedPacket::Duplicate)
                     } else {
                         Err(PacketReceiveError {
                             id,
@@ -701,16 +701,16 @@ impl ReceivePacketBuffer {
         }
     }
 
-    /// The sender is aware that all packets have been received, so the id can be removed.
-    fn done(&mut self, id: PacketId) -> Result<(), InvalidDonePacketId> {
-        if self.packets.remove(&id).is_some() {
-            Ok(())
-        } else {
-            Err(InvalidDonePacketId { id })
-        }
+    /// The sender will no longer send any parts for this packet.
+    ///
+    /// Either because all parts were acked or because the packet was canceled.
+    ///
+    /// Returns `true` if the client was aware of this packet.
+    fn done(&mut self, id: PacketId) -> bool {
+        self.packets.remove(&id).is_some()
     }
 
-    fn stats(&self, id: PacketId) -> PacketInStats {
+    fn stats(&self, _id: PacketId) -> PacketInStats {
         todo!()
     }
 
@@ -735,7 +735,7 @@ pub(crate) enum ReceivedPacketHandling<'a> {
     /// A part of a packet was acked.
     Ack(ReceivedPacket<'a>),
     /// The sender is aware that all packets have been received, so the receiver can forget it.
-    Done,
+    Done { known_packet: bool },
     /// This packet should be handled by someone else.
     Unhandled,
 }
@@ -781,7 +781,7 @@ pub struct SeqIndexOutOfRange {
 }
 
 #[derive(Debug, Error)]
-#[error("the packet sequence index {seq_index} got acked before it sent")]
+#[error("the packet sequence index {seq_index} got acked before it was sent")]
 pub struct SeqIndexAckedBeforeSent {
     pub seq_index: SeqIndex,
 }
@@ -810,7 +810,9 @@ pub(crate) trait NonBlocking: Copy {
     fn send(self, buf: &[u8]) -> io::Result<bool>;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
+#[derive(
+    Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, IntoPrimitive, TryFromPrimitive,
+)]
 #[repr(u8)]
 pub(crate) enum PacketKind {
     /// Used to check for compatibility between client and server.

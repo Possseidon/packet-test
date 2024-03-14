@@ -23,7 +23,9 @@ pub(crate) struct PacketOut {
     /// Contains the packets to be sent.
     packet_queue: PacketQueue,
     /// The last time a batch of packets was sent.
-    last_send: Instant,
+    ///
+    /// Set to `None` if the packet was canceled.
+    last_send: Option<Instant>,
     /// Updated whenever and ack is received; used to time out old packets.
     awaiting_ack_since: Instant,
     /// Up to how many packets are sent at once.
@@ -47,7 +49,7 @@ impl PacketOut {
         let now = Instant::now();
         Ok(Self {
             packet_queue,
-            last_send: now,
+            last_send: Some(now),
             awaiting_ack_since: now,
             batch_size: initial_batch_size,
             last_batch_size,
@@ -69,14 +71,19 @@ impl PacketOut {
 
     /// Resends parts of the packet that have not yet been acked.
     ///
-    /// Returns `true` if the entire packet was acked and a `Done` was sent out.
+    /// Returns `true` if the entire packet was acked and a `Done` was sent out, meaning the packet
+    /// can be discarded.
     pub(crate) fn send_pending(
         &mut self,
         id: PacketId,
         resend_delay: Duration,
         socket: impl NonBlocking,
     ) -> io::Result<bool> {
-        if self.last_send.elapsed() < resend_delay {
+        let Some(last_send) = self.last_send else {
+            return done(id, socket);
+        };
+
+        if last_send.elapsed() < resend_delay {
             return Ok(false);
         }
 
@@ -84,14 +91,21 @@ impl PacketOut {
             Self::balance_batch_size(self.batch_size, self.last_batch_acks, self.last_batch_size);
 
         match self.packet_queue.send_unacked(self.batch_size, socket)? {
-            (0, true) => Ok(done(id, socket)?),
+            (0, true) => done(id, socket),
             (count, _) => {
                 self.last_batch_size = count;
                 self.last_batch_acks = 0;
-                self.last_send = Instant::now();
+                self.last_send = Some(Instant::now());
                 Ok(false)
             }
         }
+    }
+
+    /// Marks this packet as canceled.
+    ///
+    /// This causes [`Self::send_pending`] to send out `Done`, even if it has not yet been acked.
+    pub(crate) fn cancel(&mut self) {
+        self.last_send = None;
     }
 
     /// Returns the current number of bytes of the payload that are being sent every second.
@@ -199,9 +213,7 @@ impl PacketQueue {
         socket: impl NonBlocking,
     ) -> io::Result<(BatchSize, bool)> {
         let mut count = 0;
-        println!("Sending unacked packets...");
         for buf in self.unacked(batch_size.get().into()) {
-            println!("  {} bytes", buf.len());
             if !socket.send(buf)? {
                 return Ok((count, false));
             }
@@ -230,7 +242,6 @@ impl PacketQueue {
 
     /// Marks the packet as acked and returns true if it was already acked previously.
     fn ack(&mut self, seq_index: SeqIndex) -> Result<bool, SeqIndexAckedBeforeSent> {
-        println!("  received ack for {seq_index}");
         let acked = &mut self
             .packets
             .get_mut(usize::try_from(seq_index).unwrap())

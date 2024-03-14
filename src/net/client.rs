@@ -18,7 +18,10 @@ use crate::{
     },
 };
 
-use super::{ConnectionHandler, DefaultConnectionHandler, HandlerError};
+use super::{
+    BasicLogConnectionHandler, ConnectionHandler, DefaultConnectionHandler, HandlerError, PartInfo,
+    RawPacket,
+};
 
 // TODO: Make sure I've used swap_remove to remove entries from the servers vector
 
@@ -120,7 +123,7 @@ impl<P: Packets> Client<P> {
     /// Resets the compatibility state for the given server.
     pub fn refresh_all(&mut self) -> io::Result<()> {
         for listener in &mut self.listeners {
-            listener.refresh(&mut self.socket)?;
+            listener.refresh(&self.socket)?;
         }
         Ok(())
     }
@@ -238,9 +241,9 @@ impl<P: Packets> Client<P> {
         <ServerConnectionPacket<P> as Archive>::Archived: for<'a> CheckBytes<DefaultValidator<'a>>,
     {
         let mut connected = self.state != ClientState::Disconnected;
-        self.listeners.retain_mut(|server| {
-            server.update(
-                &mut self.socket,
+        self.listeners.retain_mut(|listener| {
+            listener.update(
+                &self.socket,
                 handler,
                 replace(&mut connected, false).then_some(&mut self.state),
                 &self.config,
@@ -317,7 +320,7 @@ impl<P: Packets> Client<P> {
                         Ok(packet_handling) => packet_handling,
                         Err(error) => {
                             handler.error(HandlerError::Handle {
-                                peer_addr: server_addr,
+                                sender_addr: server_addr,
                                 error,
                             });
                             continue;
@@ -326,17 +329,31 @@ impl<P: Packets> Client<P> {
 
                     match packet_handling {
                         PacketHandling::Received(ack) => match ack {
-                            ReceivedPacket::Pending { duplicate } => {
-                                handler.pending(server_addr, duplicate);
+                            ReceivedPacket::Pending => {
+                                handler.raw_packet(RawPacket::Part {
+                                    sender_addr: server_addr,
+                                    info: PartInfo::Pending,
+                                });
+                            }
+                            ReceivedPacket::Duplicate => {
+                                handler.raw_packet(RawPacket::Part {
+                                    sender_addr: server_addr,
+                                    info: PartInfo::Duplicate,
+                                });
                             }
                             ReceivedPacket::Reassembled(bytes) => {
+                                handler.raw_packet(RawPacket::Part {
+                                    sender_addr: server_addr,
+                                    info: PartInfo::Reassembled,
+                                });
+
                                 let packet =
                                     check_archived_root::<ServerConnectionPacket<P>>(bytes);
                                 let packet = match packet {
                                     Ok(packet) => packet,
                                     Err(error) => {
                                         handler.error(HandlerError::PacketValidation {
-                                            peer_addr: server_addr,
+                                            sender_addr: server_addr,
                                             error: Box::new(error),
                                         });
                                         continue;
@@ -400,17 +417,50 @@ impl<P: Packets> Client<P> {
                                 }
                             }
                         },
-                        PacketHandling::Done => {
-                            handler.done(server_addr);
+                        PacketHandling::Done { known_packet } => {
+                            handler.raw_packet(RawPacket::Done {
+                                sender_addr: server_addr,
+                                known_packet,
+                            });
                         }
                         PacketHandling::Ack { duplicate } => {
-                            handler.ack(server_addr, duplicate);
+                            handler.raw_packet(RawPacket::Ack {
+                                receiver_addr: server_addr,
+                                duplicate,
+                            });
                         }
                     }
                 }
                 ServerState::Incompatible(_) => {
                     handler.unexpected(server_addr, UnexpectedServerPacket::Incompatible);
                 }
+            }
+        }
+
+        self.timeout_connection(handler);
+    }
+
+    fn timeout_connection(&mut self, handler: &mut impl ClientHandler<P>) {
+        for listener in &mut self.listeners {
+            match &mut listener.state {
+                ServerState::PendingVersion { .. } => {}
+                ServerState::Compatible {
+                    last_interaction, ..
+                } => {
+                    if last_interaction.elapsed() > self.config.timeout {
+                        self.state = ClientState::Disconnected;
+                        handler.error(HandlerError::Timeout {
+                            peer_addr: listener.server_addr,
+                        });
+                        if let Err(error) = listener.refresh(&self.socket) {
+                            handler.error(HandlerError::Send {
+                                receiver_addr: listener.server_addr,
+                                error,
+                            })
+                        }
+                    }
+                }
+                ServerState::Incompatible(_) => {}
             }
         }
     }
@@ -448,7 +498,7 @@ pub enum Compatibility<'a, P: Packets> {
     Incompatible(&'a P::CompatibilityError),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum ClientState {
     /// Client is not connected to a server.
     Disconnected,
@@ -461,20 +511,81 @@ pub enum ClientState {
 }
 
 pub trait ClientHandler<P: Packets>: ConnectionHandler {
-    fn compatibility(&mut self, _version: P::Version) -> Result<(), P::CompatibilityError> {
+    /// Checks if the client is compatible with the version sent by the server.
+    fn compatibility(&mut self, version: P::Version) -> Result<(), P::CompatibilityError> {
+        _ = version;
         Ok(())
     }
 
-    fn status(&mut self, _server_addr: SocketAddr, _status: &<P::Status as Archive>::Archived) {}
-    fn accept(&mut self, _accept: &<P::Accept as Archive>::Archived) {}
-    fn reject(&mut self, _reject: &<P::Reject as Archive>::Archived) {}
-    fn kick(&mut self, _kick: &<P::Kick as Archive>::Archived) {}
-    fn packet(&mut self, _packet: &<P::Server as Archive>::Archived) {}
+    /// A server sent a status response.
+    ///
+    /// Unlike the other packets, this one is not limited to the connected server.
+    fn status(&mut self, server_addr: SocketAddr, status: &<P::Status as Archive>::Archived) {
+        _ = (server_addr, status);
+    }
+    /// The server has accepted the client.
+    fn accept(&mut self, accept: &<P::Accept as Archive>::Archived) {
+        _ = accept;
+    }
+    /// The server has rejected the client.
+    fn reject(&mut self, reject: &<P::Reject as Archive>::Archived) {
+        _ = reject;
+    }
+    /// The server has kicked the client.
+    fn kick(&mut self, kick: &<P::Kick as Archive>::Archived) {
+        _ = kick;
+    }
+    /// The server sent a user-defined packet.
+    fn packet(&mut self, packet: &<P::Server as Archive>::Archived) {
+        _ = packet;
+    }
 
-    fn unexpected(&mut self, _server_addr: SocketAddr, _unexpected: UnexpectedServerPacket) {}
+    /// A server sent an unexpected packet.
+    fn unexpected(&mut self, server_addr: SocketAddr, unexpected: UnexpectedServerPacket) {
+        _ = (server_addr, unexpected);
+    }
 }
 
 impl<P: Packets> ClientHandler<P> for DefaultConnectionHandler {}
+
+impl<P: Packets> ClientHandler<P> for BasicLogConnectionHandler
+where
+    P::Version: std::fmt::Debug,
+    <P::Status as Archive>::Archived: std::fmt::Debug,
+    <P::Accept as Archive>::Archived: std::fmt::Debug,
+    <P::Reject as Archive>::Archived: std::fmt::Debug,
+    <P::Kick as Archive>::Archived: std::fmt::Debug,
+    <P::Server as Archive>::Archived: std::fmt::Debug,
+{
+    fn compatibility(&mut self, version: P::Version) -> Result<(), P::CompatibilityError> {
+        println!("{version:?}");
+        Ok(())
+    }
+
+    fn status(&mut self, server_addr: SocketAddr, status: &<P::Status as Archive>::Archived) {
+        println!("{server_addr} {status:?}");
+    }
+
+    fn accept(&mut self, accept: &<P::Accept as Archive>::Archived) {
+        println!("{accept:?}");
+    }
+
+    fn reject(&mut self, reject: &<P::Reject as Archive>::Archived) {
+        println!("{reject:?}");
+    }
+
+    fn kick(&mut self, kick: &<P::Kick as Archive>::Archived) {
+        println!("{kick:?}");
+    }
+
+    fn packet(&mut self, packet: &<P::Server as Archive>::Archived) {
+        println!("{packet:?}");
+    }
+
+    fn unexpected(&mut self, server_addr: SocketAddr, unexpected: UnexpectedServerPacket) {
+        println!("{server_addr} {unexpected:?}");
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum UnexpectedServerPacket {
@@ -488,7 +599,7 @@ pub enum UnexpectedServerPacket {
     MalformedVersion,
     #[error("not connected to this server")]
     NotConnected,
-    #[error("incompatible with the server")]
+    #[error("incompatible with this server")]
     Incompatible,
 }
 
@@ -552,7 +663,7 @@ impl<P: Packets> ServerListener<P> {
         })
     }
 
-    fn refresh(&mut self, socket: &mut UdpSocket) -> io::Result<()> {
+    fn refresh(&mut self, socket: &UdpSocket) -> io::Result<()> {
         self.state = Self::pending_version_query(socket, self.server_addr)?;
         Ok(())
     }
@@ -571,7 +682,7 @@ impl<P: Packets> ServerListener<P> {
     /// - (Re)Send pending packets including version queries
     fn update(
         &mut self,
-        socket: &mut UdpSocket,
+        socket: &UdpSocket,
         handler: &mut impl ClientHandler<P>,
         state: Option<&mut ClientState>,
         config: &ConnectionConfig,
@@ -591,7 +702,7 @@ impl<P: Packets> ServerListener<P> {
                         }
                         Err(error) => {
                             handler.error(HandlerError::Send {
-                                peer_addr: self.server_addr,
+                                receiver_addr: self.server_addr,
                                 error,
                             });
                             false
@@ -609,7 +720,7 @@ impl<P: Packets> ServerListener<P> {
                 );
                 if let Err(error) = result {
                     handler.error(HandlerError::Send {
-                        peer_addr: self.server_addr,
+                        receiver_addr: self.server_addr,
                         error,
                     });
                     if let Some(state) = state {
@@ -641,6 +752,7 @@ enum ServerState<P: Packets> {
     },
     Compatible {
         buffers: ClientPacketBuffers<P>,
+        // TODO: last_interaction is only interesting if actually connected
         last_interaction: Instant,
     },
     Incompatible(P::CompatibilityError),

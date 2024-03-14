@@ -2091,11 +2091,11 @@
       "locked": false,
       "fontSize": 20,
       "fontFamily": 1,
-      "text": "Server Cancelled \nthe Packet",
+      "text": "Server canceled \nthe Packet",
       "textAlign": "center",
       "verticalAlign": "middle",
       "containerId": "lKSSml0foFfmnmwhweoRh",
-      "originalText": "Server Cancelled the Packet",
+      "originalText": "Server canceled the Packet",
       "lineHeight": 1.25,
       "baseline": 46
     },

@@ -4,16 +4,16 @@
 // use packet_test::{handle_client_packets, ping_clients, timeout_clients, Server, ServerEntity};
 // use uuid::Uuid;
 
-use std::{net::Ipv4Addr, time::Duration};
+use std::net::Ipv4Addr;
 
 use anyhow::Result;
-use packet_test::net::{server::Server, DefaultConnectionHandler};
+use packet_test::net::{server::Server, BasicLogConnectionHandler};
 
 fn main() -> Result<()> {
     let mut server = <Server>::host((Ipv4Addr::LOCALHOST, 42069))?;
     loop {
-        server.update(&mut DefaultConnectionHandler);
-        std::thread::sleep(Duration::from_millis(100));
+        server.update(&mut BasicLogConnectionHandler);
+        // std::thread::sleep(Duration::from_millis(100));
     }
 }
 
