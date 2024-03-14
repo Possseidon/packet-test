@@ -24,7 +24,7 @@ pub(crate) struct PacketOut {
     packet_queue: PacketQueue,
     /// The last time a batch of packets was sent.
     ///
-    /// Set to `None` if the packet was canceled.
+    /// Set to [`None`] if the packet was canceled.
     last_send: Option<Instant>,
     /// Updated whenever and ack is received; used to time out old packets.
     awaiting_ack_since: Instant,

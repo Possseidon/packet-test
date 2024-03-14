@@ -20,12 +20,21 @@ use super::{
 };
 
 pub struct Server<P: Packets = DefaultPackets> {
+    /// The configuration of the server.
     config: ServerConfig,
+    /// The single UDP socket used for communiating with all clients.
     socket: UdpSocket,
-    /// All connections to clients.
+    /// All clients that the server is listening to, excluding the ones that are connected.
     ///
-    /// A client cannot move position, since the order is also used by entity change tracking.
-    connections: Vec<Option<Connection<P>>>,
+    /// Clients get added to this list by sending a version query (an empty packet) and get removed
+    /// after [`ServerConfig::listener_timeout`].
+    listeners: Vec<ClientListener<P>>,
+    /// All clients that are connected to the server.
+    ///
+    /// Clients get moved from `listeners` to this list when they try to connect. Connected clients
+    /// cannot move position, since the order is also used by entity change tracking. Instead, they
+    /// are simply set to [`None`] upon disconnection and can be reused by new connections.
+    connections: Vec<Option<ConnectedClient<P>>>,
 }
 
 impl<P: Packets> Server<P> {
@@ -42,18 +51,21 @@ impl<P: Packets> Server<P> {
         Ok(Self {
             config,
             socket,
+            listeners: Default::default(),
             connections: Default::default(),
         })
     }
 
     pub fn client(&mut self, client_addr: SocketAddr) -> Option<Client<P>> {
-        self.connections
+        self.listeners
             .iter_mut()
             .flatten()
             .find(|connection| connection.client_addr == client_addr)
-            .map(|connection| Client {
+            .and_then(|connection| connection.client.as_mut())
+            .map(|client| Client {
                 socket: &self.socket,
-                connection,
+                client_addr,
+                buffers: &mut client.buffers,
                 background_serialization_threshold: self
                     .config
                     .connection
@@ -65,7 +77,7 @@ impl<P: Packets> Server<P> {
     where
         <ClientConnectionPacket<P> as Archive>::Archived: for<'a> CheckBytes<DefaultValidator<'a>>,
     {
-        for connection_entry in self.connections.iter_mut() {
+        for connection_entry in self.listeners.iter_mut() {
             let Some(connection) = connection_entry else {
                 continue;
             };
@@ -103,43 +115,61 @@ impl<P: Packets> Server<P> {
                 }
             };
 
-            let connection_entry = self.connections.iter_mut().find(|connection| {
+            let is_version_request = buf.is_empty();
+
+            let connection_entry = self.listeners.iter_mut().find(|connection| {
                 connection
                     .as_ref()
                     .is_some_and(|connection| connection.client_addr == client_addr)
             });
 
-            let connection_entry = if let Some(connection_entry) = connection_entry {
-                connection_entry
-            } else {
-                let now = Instant::now();
-                self.connections.push(Some(Connection {
-                    connected: false,
-                    client_addr,
-                    ping_id: Uuid::new_v4(),
-                    ping: now,
-                    pong: None,
-                    buffers: PacketBuffers::new(self.config.connection.initial_send_batch_size),
-                }));
-                self.connections.last_mut().unwrap()
+            let Some(connection_entry) = connection_entry else {
+                if !is_version_request {
+                    handler.unexpected(client_addr, UnexpectedClientPacket::UnknownCompatibility);
+                    continue;
+                }
+
+                match Self::send_version(&self.socket, &mut packet_buf, handler, client_addr) {
+                    Ok(sent) => {
+                        if !sent {
+                            continue;
+                        }
+                        let now = Instant::now();
+                        self.listeners.push(Some(ClientListener {
+                            connected: false,
+                            client_addr,
+                            ping_id: Uuid::new_v4(),
+                            ping: now,
+                            pong: None,
+                            buffers: PacketBuffers::new(
+                                self.config.connection.initial_send_batch_size,
+                            ),
+                        }));
+                    }
+                    Err(error) => {
+                        handler.error(HandlerError::Send {
+                            receiver_addr: client_addr,
+                            error,
+                        });
+                    }
+                }
+                continue;
             };
 
-            if buf.is_empty() {
-                // empty packet corresponds to a version query
-                packet_buf[0] = PacketKind::Version.into();
-                let version_len = handler.version().write(&mut packet_buf[1..]);
-                let buf = &packet_buf[..version_len + 1];
-                if let Err(error) = NonBlockingUdpSocket::new(&self.socket, client_addr).send(buf) {
+            let connection = connection_entry.as_mut().unwrap();
+
+            if is_version_request {
+                if let Err(error) =
+                    Self::send_version(&self.socket, &mut packet_buf, handler, client_addr)
+                {
                     handler.error(HandlerError::Send {
                         receiver_addr: client_addr,
                         error,
                     });
                 }
-                // ignore if it wasn't sent because the socket would have blocked
+                // just try again the next time if it couldn't be sent
                 continue;
             }
-
-            let connection = connection_entry.as_mut().unwrap();
 
             let packet_handling = connection
                 .buffers
@@ -293,6 +323,18 @@ impl<P: Packets> Server<P> {
             }
         }
     }
+
+    fn send_version(
+        socket: &UdpSocket,
+        packet_buf: &mut [u8; PACKET_BUFFER_SIZE],
+        handler: &mut impl ServerHandler<P>,
+        client_addr: SocketAddr,
+    ) -> io::Result<bool> {
+        packet_buf[0] = PacketKind::Version.into();
+        let version_len = handler.version().write(&mut packet_buf[1..]);
+        let buf = &packet_buf[..version_len + 1];
+        NonBlockingUdpSocket::new(socket, client_addr).send(buf)
+    }
 }
 
 impl<P: Packets> std::fmt::Debug for Server<P> {
@@ -300,7 +342,7 @@ impl<P: Packets> std::fmt::Debug for Server<P> {
         f.debug_struct("Server")
             .field("config", &self.config)
             .field("socket", &self.socket)
-            .field("connections", &self.connections)
+            .field("connections", &self.listeners)
             .finish()
     }
 }
@@ -467,8 +509,8 @@ where
 
 #[derive(Debug, Error)]
 pub enum UnexpectedClientPacket {
-    #[error("packet during pending compatible check")]
-    PendingCompatibility,
+    #[error("client can't know if it is compatible")]
+    UnknownCompatibility,
     #[error("not connected to this client")]
     NotConnected,
     #[error("incompatible with this client")]
@@ -479,7 +521,8 @@ pub enum UnexpectedClientPacket {
 
 pub struct Client<'a, P: Packets> {
     socket: &'a UdpSocket,
-    connection: &'a mut Connection<P>,
+    client_addr: SocketAddr,
+    buffers: &'a mut ServerPacketBuffers<P>,
     background_serialization_threshold: usize,
 }
 
@@ -490,26 +533,28 @@ impl<'a, P: Packets> Client<'a, P> {
     }
 
     fn send_raw(&'a mut self, packet: ServerConnectionPacket<P>) -> io::Result<PacketId> {
-        self.connection
-            .buffers
+        self.buffers
             .send(packet, self.background_serialization_threshold, {
-                NonBlockingUdpSocket::new(self.socket, self.connection.client_addr)
+                NonBlockingUdpSocket::new(self.socket, self.client_addr)
             })
     }
-
-    // /// Kicks the client.
-    // pub fn kick(&'a mut self) -> io::Result<PacketId> {
-    //     self.connection
-    //         .buffers
-    //         .send(ServerConnectionPacket::Kick, 1, {
-    //             |buf| self.socket.send_to(buf, self.connection.addr)
-    //         })
-    // }
 }
 
-struct Connection<P: Packets> {
-    /// Connections
-    connected: bool,
+struct ClientListener<P: Packets> {
+    client_addr: SocketAddr,
+    client: Option<ConnectedClient<P>>,
+}
+
+impl<P: Packets> std::fmt::Debug for ClientListener<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientListener")
+            .field("client_addr", &self.client_addr)
+            .field("client", &self.client)
+            .finish()
+    }
+}
+
+struct ConnectedClient<P: Packets> {
     client_addr: SocketAddr,
     ping_id: Uuid,
     ping: Instant,
@@ -519,11 +564,9 @@ struct Connection<P: Packets> {
     // updates: UpdateTracker,
 }
 
-// manual impl, since P doesn't have to be Debug
-impl<P: Packets> std::fmt::Debug for Connection<P> {
+impl<P: Packets> std::fmt::Debug for ConnectedClient<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Connection")
-            .field("client_addr", &self.client_addr)
+        f.debug_struct("ConnectedClient")
             .field("ping_id", &self.ping_id)
             .field("ping", &self.ping)
             .field("pong", &self.pong)

@@ -254,7 +254,9 @@ impl UpdatePacket for NoPacket {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct ConnectionConfig {
     /// How long to wait for a packet before disconnecting.
-    pub timeout: Duration,
+    ///
+    /// If set to [`None`], it will wait forever.
+    pub timeout: Option<Duration>,
     /// How long to wait before trying to send a packet again.
     pub resend_delay: Duration,
     /// How many packets are sent at once initially for new connections.
@@ -270,7 +272,7 @@ pub struct ConnectionConfig {
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(10),
+            timeout: Some(Duration::from_secs(10)),
             resend_delay: Duration::from_secs(1),
             initial_send_batch_size: NonZeroBatchSize::new(8).unwrap(),
             background_serialization_threshold: 8,
@@ -281,12 +283,18 @@ impl Default for ConnectionConfig {
 /// Server specific configuration.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct ServerConfig {
+    /// General connection related configuration.
     pub connection: ConnectionConfig,
     /// How long to wait between each ping.
     ///
     /// Should be considerably less than [`ConnectionConfig::timeout`] to avoid timeouts when there
     /// aren't any other packets being sent for a while.
     pub ping_delay: Duration,
+    /// How long to wait before a server forgets a client.
+    ///
+    /// This means the client will have to query its compatibility again. If set to [`None`] the
+    /// server will never forget any clients unless explicitly told to do so via [`Server::forget`].
+    pub listener_timeout: Option<Duration>,
 }
 
 impl Default for ServerConfig {
@@ -294,6 +302,7 @@ impl Default for ServerConfig {
         Self {
             connection: Default::default(),
             ping_delay: Duration::from_secs(3),
+            listener_timeout: None,
         }
     }
 }
@@ -456,6 +465,7 @@ impl SendPacketBuffer {
                     })
                 }
                 PacketKind::Version
+                | PacketKind::Ping
                 | PacketKind::Part
                 | PacketKind::LastPart
                 | PacketKind::Done
@@ -643,9 +653,10 @@ impl ReceivePacketBuffer {
                 PacketKind::Done => Ok(ReceivedPacketHandling::Done {
                     known_packet: self.done(id()?),
                 }),
-                PacketKind::Version | PacketKind::Ack | PacketKind::FirstUpdate => {
-                    Ok(ReceivedPacketHandling::Unhandled)
-                }
+                PacketKind::Version
+                | PacketKind::Ping
+                | PacketKind::Ack
+                | PacketKind::FirstUpdate => Ok(ReceivedPacketHandling::Unhandled),
             }
         } else {
             Ok(ReceivedPacketHandling::Unhandled)
@@ -820,6 +831,16 @@ pub(crate) enum PacketKind {
     /// - A client sends out an empty packet to a server to request its version.
     /// - A server, in turn, responds with a [`Packets::Version`] packet.
     Version,
+    /// Sent out periodically by the server, expecting the client to respond to it.
+    ///
+    /// - If a server doesn't get a pong for a long time, that client gets timed out.
+    /// - If a client doesn't receive a ping from the server, it also times out.
+    ///
+    /// Pongs also use [`PacketKind::Ping`]. It is simply considered a "pong" when sent by a client.
+    ///
+    /// Every new ping packet also contains a freshly generated UUID that must be provided in the
+    /// pong packet to prevent clients from faking their ping times by sending pongs before a ping.
+    Ping,
     /// A part of a reliable packet.
     Part,
     /// The last part of a reliable packet.

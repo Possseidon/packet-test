@@ -752,7 +752,8 @@ enum ServerState<P: Packets> {
     },
     Compatible {
         buffers: ClientPacketBuffers<P>,
-        // TODO: last_interaction is only interesting if actually connected
+        // TODO: last_interaction is only interesting for timeouts if actually connected, but it
+        //       doesn't hurt to update it for other servers as well
         last_interaction: Instant,
     },
     Incompatible(P::CompatibilityError),
