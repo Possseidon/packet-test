@@ -1,5 +1,4 @@
 use std::{
-    convert::Infallible,
     mem::take,
     num::NonZeroUsize,
     sync::mpsc::{sync_channel, Receiver, SyncSender},
@@ -50,10 +49,10 @@ pub(crate) fn serialize_packet<T: Packet>(
         ChannelPacketSerializer {
             skip,
             buf: PacketBuffer::new(id),
-            tx: Some(tx),
+            tx,
         }
         .serialize_value(&value)
-        .expect("should be infallible");
+        .ok();
     });
     SerializedPacket::Channel(rx)
 }
@@ -99,12 +98,14 @@ impl Serializer for VecPacketSerializer {
 pub struct ChannelPacketSerializer {
     skip: usize,
     buf: PacketBuffer,
-    tx: Option<SyncSender<PacketBuffer>>,
+    tx: SyncSender<PacketBuffer>,
 }
 
 impl Fallible for ChannelPacketSerializer {
-    type Error = Infallible;
+    type Error = ReceiverDropped;
 }
+
+struct ReceiverDropped;
 
 impl Serializer for ChannelPacketSerializer {
     fn pos(&self) -> usize {
@@ -112,20 +113,19 @@ impl Serializer for ChannelPacketSerializer {
     }
 
     fn write(&mut self, mut bytes: &[u8]) -> Result<(), Self::Error> {
-        let Some(tx) = &self.tx else {
-            // just skip through everything if the channel is closed
-            return Ok(());
-        };
         while !bytes.is_empty() {
             let before = bytes.len();
-            bytes = self.buf.append(bytes);
+            bytes = if self.skip > 0 {
+                self.buf.append(bytes)
+            } else {
+                self.buf.skip(bytes)
+            };
             let after = bytes.len();
             if after == before {
                 if self.skip > 0 {
                     self.skip -= 1;
-                } else if tx.send(self.buf.copy()).is_err() {
-                    self.tx = None;
-                    break;
+                } else if self.tx.send(self.buf.copy()).is_err() {
+                    return Err(ReceiverDropped);
                 }
                 self.buf.next();
             }
@@ -136,11 +136,8 @@ impl Serializer for ChannelPacketSerializer {
 
 impl Drop for ChannelPacketSerializer {
     fn drop(&mut self) {
-        if let Some(tx) = &self.tx {
-            assert!(!self.buf.is_empty());
-            self.buf.mark_last();
-            assert!(self.skip == 0);
-            tx.send(self.buf.copy()).unwrap();
-        }
+        assert!(self.skip == 0);
+        self.buf.mark_last();
+        self.tx.send(self.buf.copy()).ok();
     }
 }

@@ -319,6 +319,12 @@ impl PacketBuffer {
         &data[len..]
     }
 
+    pub(crate) fn skip<'a>(&mut self, data: &'a [u8]) -> &'a [u8] {
+        let len = data.len().min(PACKET_BUFFER_SIZE - self.len());
+        self.len = BufferIndex::try_from(self.len() + len).unwrap();
+        &data[len..]
+    }
+
     pub(crate) fn new_next(&self) -> Self {
         let mut result = Self {
             acked: false,
