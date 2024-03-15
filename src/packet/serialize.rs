@@ -15,8 +15,7 @@ use super::{send::PacketBuffer, Packet, PacketId};
 /// 2. If more packets are required, spawns a detached thread and returns a channel.
 ///
 /// The thread uses a rendezvous channel, so it only prepares a single packet without buffering
-/// additional packets in advance. If the receiver is dropped, the thread will skip through the
-/// remaining write calls and should finish relatively quickly.
+/// additional packets in advance.
 pub(crate) fn serialize_packet<T: Packet>(
     id: PacketId,
     background_serialization_threshold: usize,
@@ -30,7 +29,10 @@ pub(crate) fn serialize_packet<T: Packet>(
             buf: vec![PacketBuffer::new(id)],
         };
         match serializer.serialize_value(&value) {
-            Ok(_) => return SerializedPacket::Vec(serializer.buf),
+            Ok(_) => {
+                serializer.buf.last_mut().unwrap().mark_last();
+                return SerializedPacket::Vec(serializer.buf);
+            }
             Err(already_serialized) => already_serialized,
         }
     } else {
@@ -46,13 +48,16 @@ pub(crate) fn serialize_packet<T: Packet>(
             }
         }
 
-        ChannelPacketSerializer {
+        let mut serializer = ChannelPacketSerializer {
             skip,
             buf: PacketBuffer::new(id),
             tx,
+        };
+        if serializer.serialize_value(&value).is_ok() {
+            assert!(serializer.skip == 0);
+            serializer.buf.mark_last();
+            serializer.tx.send(serializer.buf.copy()).ok();
         }
-        .serialize_value(&value)
-        .ok();
     });
     SerializedPacket::Channel(rx)
 }
@@ -116,9 +121,9 @@ impl Serializer for ChannelPacketSerializer {
         while !bytes.is_empty() {
             let before = bytes.len();
             bytes = if self.skip > 0 {
-                self.buf.append(bytes)
-            } else {
                 self.buf.skip(bytes)
+            } else {
+                self.buf.append(bytes)
             };
             let after = bytes.len();
             if after == before {
@@ -131,13 +136,5 @@ impl Serializer for ChannelPacketSerializer {
             }
         }
         Ok(())
-    }
-}
-
-impl Drop for ChannelPacketSerializer {
-    fn drop(&mut self) {
-        assert!(self.skip == 0);
-        self.buf.mark_last();
-        self.tx.send(self.buf.copy()).ok();
     }
 }

@@ -249,13 +249,7 @@ impl<P: Packets> Client<P> {
         });
 
         let mut packet_buf = [0; PACKET_BUFFER_SIZE];
-        while let Some(result) = recv(&self.socket, &mut packet_buf, handler) {
-            let Ok((server_addr, buf)) = result else {
-                self.state = ClientState::Disconnected;
-                self.forget_all();
-                break;
-            };
-
+        while let Some((server_addr, buf)) = recv(&self.socket, &mut packet_buf, handler) {
             let Some(index) = self
                 .listeners
                 .iter_mut()
@@ -272,7 +266,7 @@ impl<P: Packets> Client<P> {
             match &mut listener.state {
                 ServerState::PendingVersion { .. } => {
                     let Some(&kind) = buf.first() else {
-                        handler.unexpected(server_addr, UnexpectedServerPacket::Empty);
+                        handler.unexpected(server_addr, UnexpectedServerPacket::EmptyPacket);
                         continue;
                     };
 
@@ -300,6 +294,25 @@ impl<P: Packets> Client<P> {
                 } => {
                     *last_interaction = Instant::now();
 
+                    if is_connection_listener {
+                        if let Some(&kind) = buf.first() {
+                            if let Ok(PacketKind::Ping) = kind.try_into() {
+                                handler.ping();
+                                if let Err(error) =
+                                    NonBlockingUdpSocket::new(&self.socket, server_addr).send(buf)
+                                {
+                                    handler.error(HandlerError::Send {
+                                        receiver_addr: server_addr,
+                                        error,
+                                    });
+                                    self.state = ClientState::Disconnected;
+                                }
+                                // ignore if it couldn't be sent because the socket would block
+                                continue;
+                            }
+                        }
+                    }
+
                     let packet_handling =
                         buffers.handle(buf, NonBlockingUdpSocket::new(&self.socket, server_addr));
 
@@ -316,18 +329,14 @@ impl<P: Packets> Client<P> {
 
                     match packet_handling {
                         PacketHandling::Received(ack) => match ack {
-                            ReceivedPacket::Pending => {
-                                handler.raw_packet(RawPacket::Part {
-                                    sender_addr: server_addr,
-                                    info: PartInfo::Pending,
-                                });
-                            }
-                            ReceivedPacket::Duplicate => {
-                                handler.raw_packet(RawPacket::Part {
-                                    sender_addr: server_addr,
-                                    info: PartInfo::Duplicate,
-                                });
-                            }
+                            ReceivedPacket::Pending => handler.raw_packet(RawPacket::Part {
+                                sender_addr: server_addr,
+                                info: PartInfo::Pending,
+                            }),
+                            ReceivedPacket::Duplicate => handler.raw_packet(RawPacket::Part {
+                                sender_addr: server_addr,
+                                info: PartInfo::Duplicate,
+                            }),
                             ReceivedPacket::Reassembled(bytes) => {
                                 handler.raw_packet(RawPacket::Part {
                                     sender_addr: server_addr,
@@ -346,6 +355,7 @@ impl<P: Packets> Client<P> {
                                         continue;
                                     }
                                 };
+
                                 match packet {
                                     ArchivedServerConnectionPacket::Status(status) => {
                                         handler.status(server_addr, status);
@@ -356,12 +366,12 @@ impl<P: Packets> Client<P> {
                                         {
                                             handler.accept(accept);
                                             self.state = ClientState::Connected;
-                                            continue;
+                                        } else {
+                                            handler.unexpected(
+                                                server_addr,
+                                                UnexpectedServerPacket::NotConnected,
+                                            );
                                         }
-                                        handler.unexpected(
-                                            server_addr,
-                                            UnexpectedServerPacket::NotConnected,
-                                        );
                                     }
                                     ArchivedServerConnectionPacket::Reject(reject) => {
                                         if is_connection_listener
@@ -369,12 +379,12 @@ impl<P: Packets> Client<P> {
                                         {
                                             handler.reject(reject);
                                             self.state = ClientState::Disconnected;
-                                            continue;
+                                        } else {
+                                            handler.unexpected(
+                                                server_addr,
+                                                UnexpectedServerPacket::NotConnected,
+                                            );
                                         }
-                                        handler.unexpected(
-                                            server_addr,
-                                            UnexpectedServerPacket::NotConnected,
-                                        );
                                     }
                                     ArchivedServerConnectionPacket::Kick(kick) => {
                                         if is_connection_listener
@@ -382,24 +392,24 @@ impl<P: Packets> Client<P> {
                                         {
                                             handler.kick(kick);
                                             self.state = ClientState::Disconnected;
-                                            continue;
+                                        } else {
+                                            handler.unexpected(
+                                                server_addr,
+                                                UnexpectedServerPacket::NotConnected,
+                                            );
                                         }
-                                        handler.unexpected(
-                                            server_addr,
-                                            UnexpectedServerPacket::NotConnected,
-                                        );
                                     }
                                     ArchivedServerConnectionPacket::User(packet) => {
                                         if is_connection_listener
                                             && self.state == ClientState::Connected
                                         {
                                             handler.packet(packet);
-                                            continue;
+                                        } else {
+                                            handler.unexpected(
+                                                server_addr,
+                                                UnexpectedServerPacket::NotConnected,
+                                            );
                                         }
-                                        handler.unexpected(
-                                            server_addr,
-                                            UnexpectedServerPacket::NotConnected,
-                                        );
                                     }
                                 }
                             }
@@ -408,14 +418,12 @@ impl<P: Packets> Client<P> {
                             handler.raw_packet(RawPacket::Done {
                                 sender_addr: server_addr,
                                 known_packet,
-                            });
+                            })
                         }
-                        PacketHandling::Ack { duplicate } => {
-                            handler.raw_packet(RawPacket::Ack {
-                                receiver_addr: server_addr,
-                                duplicate,
-                            });
-                        }
+                        PacketHandling::Ack { duplicate } => handler.raw_packet(RawPacket::Ack {
+                            receiver_addr: server_addr,
+                            duplicate,
+                        }),
                     }
                 }
                 ServerState::Incompatible(_) => {
@@ -428,9 +436,9 @@ impl<P: Packets> Client<P> {
     }
 
     fn timeout_connection(&mut self, handler: &mut impl ClientHandler<P>) {
-        for listener in &mut self.listeners {
-            match &mut listener.state {
-                ServerState::PendingVersion { .. } => {}
+        self.listeners
+            .retain_mut(|listener| match &mut listener.state {
+                ServerState::PendingVersion { .. } => true,
                 ServerState::Compatible {
                     last_interaction, ..
                 } => {
@@ -440,18 +448,13 @@ impl<P: Packets> Client<P> {
                             handler.error(HandlerError::Timeout {
                                 peer_addr: listener.server_addr,
                             });
-                            if let Err(error) = listener.refresh(&self.socket) {
-                                handler.error(HandlerError::Send {
-                                    receiver_addr: listener.server_addr,
-                                    error,
-                                })
-                            }
+                            return false;
                         }
                     }
+                    true
                 }
-                ServerState::Incompatible(_) => {}
-            }
-        }
+                ServerState::Incompatible(_) => true,
+            });
     }
 
     fn get_or_add_listener(
@@ -512,18 +515,25 @@ pub trait ClientHandler<P: Packets>: ConnectionHandler {
     fn status(&mut self, server_addr: SocketAddr, status: &<P::Status as Archive>::Archived) {
         _ = (server_addr, status);
     }
+
     /// The server has accepted the client.
     fn accept(&mut self, accept: &<P::Accept as Archive>::Archived) {
         _ = accept;
     }
+
     /// The server has rejected the client.
     fn reject(&mut self, reject: &<P::Reject as Archive>::Archived) {
         _ = reject;
     }
+
     /// The server has kicked the client.
     fn kick(&mut self, kick: &<P::Kick as Archive>::Archived) {
         _ = kick;
     }
+
+    /// The server sent a ping to which the client responded with a pong.
+    fn ping(&mut self) {}
+
     /// The server sent a user-defined packet.
     fn packet(&mut self, packet: &<P::Server as Archive>::Archived) {
         _ = packet;
@@ -547,32 +557,36 @@ where
     <P::Server as Archive>::Archived: std::fmt::Debug,
 {
     fn compatibility(&mut self, version: P::Version) -> Result<(), P::CompatibilityError> {
-        println!("{version:?}");
+        println!("got compatible version: {version:?}");
         Ok(())
     }
 
     fn status(&mut self, server_addr: SocketAddr, status: &<P::Status as Archive>::Archived) {
-        println!("{server_addr} {status:?}");
+        println!("status of {server_addr}: {status:?}");
     }
 
     fn accept(&mut self, accept: &<P::Accept as Archive>::Archived) {
-        println!("{accept:?}");
+        println!("got accepted: {accept:?}");
     }
 
     fn reject(&mut self, reject: &<P::Reject as Archive>::Archived) {
-        println!("{reject:?}");
+        println!("got rejected: {reject:?}");
     }
 
     fn kick(&mut self, kick: &<P::Kick as Archive>::Archived) {
-        println!("{kick:?}");
+        println!("got kicked: {kick:?}");
+    }
+
+    fn ping(&mut self) {
+        println!("got ping, responding with pong");
     }
 
     fn packet(&mut self, packet: &<P::Server as Archive>::Archived) {
-        println!("{packet:?}");
+        println!("got packet: {packet:?}");
     }
 
     fn unexpected(&mut self, server_addr: SocketAddr, unexpected: UnexpectedServerPacket) {
-        println!("{server_addr} {unexpected:?}");
+        println!("{server_addr} sent unexpected packet: {unexpected}");
     }
 }
 
@@ -580,16 +594,16 @@ where
 pub enum UnexpectedServerPacket {
     #[error("not listening to this server")]
     UnknownServer,
-    #[error("empty packet")]
-    Empty,
-    #[error("packet during pending compatible check")]
-    PendingCompatibility,
-    #[error("malformed version packet")]
-    MalformedVersion,
     #[error("not connected to this server")]
     NotConnected,
     #[error("incompatible with this server")]
     Incompatible,
+    #[error("empty packet")]
+    EmptyPacket,
+    #[error("packet before compatible check")]
+    PendingCompatibility,
+    #[error("malformed version packet")]
+    MalformedVersion,
 }
 
 #[derive(Debug, Error)]

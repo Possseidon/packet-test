@@ -114,11 +114,11 @@ pub struct BasicLogConnectionHandler;
 
 impl ConnectionHandler for BasicLogConnectionHandler {
     fn raw_packet(&mut self, packet: RawPacket) {
-        println!("{packet:?}");
+        println!("raw_packet: {packet:?}");
     }
 
     fn error(&mut self, error: HandlerError) {
-        println!("{error:?}");
+        println!("{error}");
     }
 }
 
@@ -152,19 +152,22 @@ impl NonBlocking for NonBlockingUdpSocket<'_> {
     }
 }
 
+/// Receives a packet from the socket, returning [`None`] if the socket would block.
+///
+/// Errors are reported to the handler. Since the errors have no context as to which peer caused it,
+/// they are generally also not very useful.
 pub(crate) fn recv<'a>(
     socket: &UdpSocket,
     packet_buf: &'a mut [u8; 512],
     handler: &mut impl ConnectionHandler,
-) -> Option<Result<(SocketAddr, &'a [u8]), ()>> {
-    Some(match socket.recv_from(packet_buf) {
-        Ok((size, addr)) => Ok((addr, &packet_buf[..size])),
+) -> Option<(SocketAddr, &'a [u8])> {
+    match socket.recv_from(packet_buf) {
+        Ok((size, addr)) => Some((addr, &packet_buf[..size])),
         Err(error) => {
-            if error.kind() == ErrorKind::WouldBlock {
-                return None;
+            if error.kind() != ErrorKind::WouldBlock {
+                handler.error(HandlerError::Recv(error));
             }
-            handler.error(HandlerError::Recv(error));
-            return Some(Err(()));
+            None
         }
-    })
+    }
 }

@@ -13,8 +13,8 @@ use crate::{
     config::ServerConfig,
     packet::{
         receive::ReceivedPacket, ArchivedClientConnectionPacket, ClientConnectionPacket,
-        DefaultPackets, NonBlocking, PacketHandling, PacketId, PacketKind, Packets,
-        ServerConnectionPacket, ServerPacketBuffers, VersionPacket, PACKET_BUFFER_SIZE,
+        DefaultPackets, HandlePacketError, NonBlocking, PacketHandling, PacketId, PacketKind,
+        Packets, ServerConnectionPacket, ServerPacketBuffers, VersionPacket, PACKET_BUFFER_SIZE,
     },
 };
 
@@ -103,15 +103,14 @@ impl<P: Packets> Server<P> {
     {
         self.update_buffers(handler);
         self.handle_packets(handler);
+        self.send_pings(handler);
     }
 
     /// Updates client buffers so they send pending packets and time out stale ones.
     fn update_buffers(&mut self, handler: &mut impl ServerHandler<P>) {
         let mut first_empty_slot = 0;
         for (index, client_entry) in self.clients.iter_mut().enumerate() {
-            let Some(client) = client_entry else {
-                continue;
-            };
+            let Some(client) = client_entry else { continue };
             first_empty_slot = index + 1;
             let result = client.buffers.update(
                 self.config.connection.resend_delay,
@@ -137,11 +136,14 @@ impl<P: Packets> Server<P> {
         <ClientConnectionPacket<P> as Archive>::Archived: for<'a> CheckBytes<DefaultValidator<'a>>,
     {
         let mut packet_buf = [0; PACKET_BUFFER_SIZE];
-        while let Some(Ok((client_addr, buf))) = recv(&self.socket, &mut packet_buf, handler) {
-            let listening = self.listeners.contains_key(&client_addr);
-
+        while let Some((client_addr, buf)) = recv(&self.socket, &mut packet_buf, handler) {
             if buf.is_empty() {
-                self.handle_version_request(&mut packet_buf, handler, client_addr, listening);
+                self.handle_version_request(
+                    &mut packet_buf,
+                    handler,
+                    client_addr,
+                    self.listeners.contains_key(&client_addr),
+                );
                 continue;
             }
 
@@ -151,7 +153,31 @@ impl<P: Packets> Server<P> {
                     .as_ref()
                     .is_some_and(|client| client.client_addr == client_addr)
             }) {
-                let buffers = &mut client_entry.as_mut().unwrap().buffers;
+                let client = client_entry.as_mut().unwrap();
+
+                if PacketKind::try_from(buf[0]) == Ok(PacketKind::Ping) {
+                    let Some(active_ping) = client.active_ping else {
+                        handler.pong(client_addr, false);
+                        continue;
+                    };
+                    let Ok(ping_id) = Uuid::from_slice(&buf[1..]) else {
+                        handler.error(HandlerError::Handle {
+                            sender_addr: client_addr,
+                            error: HandlePacketError::Malformed,
+                        });
+                        continue;
+                    };
+                    if ping_id == active_ping.ping_id {
+                        client.last_pong = Some(Instant::now());
+                        client.missed_pongs = 0;
+                        handler.pong(client_addr, true);
+                    } else {
+                        handler.pong(client_addr, false);
+                    }
+                    continue;
+                }
+
+                let buffers = &mut client.buffers;
                 let Some(packet) =
                     Self::handle_buffers(buffers, buf, &self.socket, client_addr, handler)
                 else {
@@ -381,6 +407,59 @@ impl<P: Packets> Server<P> {
 
         None
     }
+
+    fn send_pings(&mut self, handler: &mut impl ServerHandler<P>) {
+        for client_entry in self.clients.iter_mut() {
+            let Some(client) = client_entry else { continue };
+
+            let ping_due = client
+                .active_ping
+                .map(|active_ping| active_ping.ping.elapsed() >= self.config.ping_delay)
+                .unwrap_or(true);
+            if !ping_due {
+                continue;
+            }
+
+            let sent_ping = client.active_ping.take().is_some();
+            let received_pong = client.last_pong.take().is_some();
+            if sent_ping && !received_pong {
+                client.missed_pongs = client.missed_pongs.saturating_add(1);
+
+                if let Some(max_missed_pongs) = self.config.max_missed_pongs {
+                    if client.missed_pongs > max_missed_pongs {
+                        handler.error(HandlerError::Timeout {
+                            peer_addr: client.client_addr,
+                        });
+                        *client_entry = None;
+                        continue;
+                    }
+                }
+            }
+
+            let ping_id = Uuid::new_v4();
+            let mut buf = [0; 17];
+            buf[0] = PacketKind::Ping.into();
+            buf[1..17].copy_from_slice(ping_id.as_bytes());
+            match NonBlockingUdpSocket::new(&self.socket, client.client_addr).send(&buf) {
+                Ok(sent) => {
+                    if sent {
+                        client.active_ping = Some(ActivePing {
+                            ping_id,
+                            ping: Instant::now(),
+                        });
+                        handler.ping(client.client_addr);
+                    }
+                }
+                Err(error) => {
+                    handler.error(HandlerError::Send {
+                        receiver_addr: client.client_addr,
+                        error,
+                    });
+                    *client_entry = None;
+                }
+            }
+        }
+    }
 }
 
 impl<P: Packets> std::fmt::Debug for Server<P> {
@@ -401,26 +480,46 @@ pub trait ServerHandler<P: Packets>: ConnectionHandler {
     /// send (partial) status information to clients even if they are incompatible.
     fn version(&mut self) -> P::Version;
 
+    /// A client sent a version request, so the server is now listening to it.
+    fn listen(&mut self, server_addr: SocketAddr) {
+        _ = server_addr;
+    }
+
     /// Returns the status that should be sent to clients.
     fn query(
         &mut self,
         client_addr: SocketAddr,
         query: &<P::Query as Archive>::Archived,
     ) -> P::Status;
+
     /// Returns whether the given client is allowed to connect (accept) or not (reject).
     fn connect(
         &mut self,
         client_addr: SocketAddr,
         connect: &<P::Connect as Archive>::Archived,
     ) -> Connect<P>;
+
     /// Called when a client disconnects on its own.
     fn disconnect(
         &mut self,
         client_addr: SocketAddr,
-        disconect: &<P::Disconnect as Archive>::Archived,
+        disconnect: &<P::Disconnect as Archive>::Archived,
     ) {
-        _ = (client_addr, disconect);
+        _ = (client_addr, disconnect);
     }
+
+    /// A ping was sent to a client.
+    fn ping(&mut self, client_addr: SocketAddr) {
+        _ = client_addr;
+    }
+
+    /// A pong was received from a client.
+    ///
+    /// Pongs are only `valid` if the packet matches the one that was sent out by the server.
+    fn pong(&mut self, client_addr: SocketAddr, valid: bool) {
+        _ = (client_addr, valid);
+    }
+
     /// A client sent a packet.
     fn packet(&mut self, client_addr: SocketAddr, packet: &<P::Client as Archive>::Archived) {
         _ = (client_addr, packet);
@@ -465,12 +564,13 @@ where
     <P::Query as Archive>::Archived: std::fmt::Debug,
     P::Status: std::fmt::Debug + Default,
     <P::Connect as Archive>::Archived: std::fmt::Debug,
-    P::Accept: Default,
-    Connect<P>: std::fmt::Debug,
+    P::Accept: std::fmt::Debug + Default,
+    <P::Disconnect as Archive>::Archived: std::fmt::Debug,
+    <P::Client as Archive>::Archived: std::fmt::Debug,
 {
     fn version(&mut self) -> P::Version {
         let version = Default::default();
-        println!("{version:?}");
+        println!("server version: {version:?}");
         version
     }
 
@@ -480,7 +580,8 @@ where
         query: &<P::Query as Archive>::Archived,
     ) -> P::Status {
         let status = Default::default();
-        println!("{client_addr} {query:?} {status:?}");
+        println!("{client_addr} sent status query: {query:?}");
+        println!("▶ responding with status: {status:?}");
         status
     }
 
@@ -489,9 +590,39 @@ where
         client_addr: SocketAddr,
         connect: &<P::Connect as Archive>::Archived,
     ) -> Connect<P> {
-        let accept = Connect::Accept(Default::default());
-        println!("{client_addr} {connect:?} {accept:?}");
-        accept
+        println!("{client_addr} wants to connect with: {connect:?}");
+        let accept = <P::Accept as Default>::default();
+        println!("▶ accepted with: {accept:?}");
+        Connect::Accept(accept)
+    }
+
+    fn disconnect(
+        &mut self,
+        client_addr: SocketAddr,
+        disconnect: &<<P as Packets>::Disconnect as Archive>::Archived,
+    ) {
+        println!("{client_addr} disconnected: {disconnect:?}");
+    }
+
+    fn ping(&mut self, client_addr: SocketAddr) {
+        println!("sent ping to {client_addr}");
+    }
+
+    fn pong(&mut self, client_addr: SocketAddr, valid: bool) {
+        let valid = if valid { "↩ received" } else { "❌ invalid" };
+        println!("{valid} pong from {client_addr}");
+    }
+
+    fn packet(
+        &mut self,
+        client_addr: SocketAddr,
+        packet: &<<P as Packets>::Client as Archive>::Archived,
+    ) {
+        println!("{client_addr} sent packet: {packet:?}");
+    }
+
+    fn unexpected(&mut self, client_addr: SocketAddr, unexpected: UnexpectedClientPacket) {
+        println!("{client_addr} sent unexpected packet: {unexpected}");
     }
 }
 
@@ -600,11 +731,11 @@ struct ClientConnection<P: Packets> {
     /// pings will be sent out, even if the client hasn't responded to this one yet.
     active_ping: Option<ActivePing>,
     /// The last time the client responded to a ping.
-    last_ping: Option<Instant>,
+    last_pong: Option<Instant>,
     /// How many pings the client has not responded to in a row.
     ///
     /// Reset whenever a pong is received. Used to time out clients.
-    missed_pings: usize,
+    missed_pongs: usize,
     // TODO: Add a way to track which entities and things are known to be up to date:
     // updates: UpdateTracker,
 }
@@ -615,8 +746,8 @@ impl<P: Packets> ClientConnection<P> {
             client_addr,
             buffers,
             active_ping: None,
-            last_ping: None,
-            missed_pings: 0,
+            last_pong: None,
+            missed_pongs: 0,
         }
     }
 }
@@ -627,8 +758,8 @@ impl<P: Packets> std::fmt::Debug for ClientConnection<P> {
             .field("client_addr", &self.client_addr)
             .field("buffers", &self.buffers)
             .field("active_ping", &self.active_ping)
-            .field("last_ping", &self.last_ping)
-            .field("missed_pings", &self.missed_pings)
+            .field("last_ping", &self.last_pong)
+            .field("missed_pings", &self.missed_pongs)
             .finish()
     }
 }
