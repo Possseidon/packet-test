@@ -250,63 +250,6 @@ impl UpdatePacket for NoPacket {
     }
 }
 
-/// Connection related configuration for both server and client.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct ConnectionConfig {
-    /// How long to wait for a packet before disconnecting.
-    ///
-    /// If set to [`None`], it will wait forever.
-    pub timeout: Option<Duration>,
-    /// How long to wait before trying to send a packet again.
-    pub resend_delay: Duration,
-    /// How many packets are sent at once initially for new connections.
-    ///
-    /// This value is adjusted automatically (on a per-connection basis for servers).
-    pub initial_send_batch_size: NonZeroBatchSize,
-    /// A packet that requires more than this number of chunks, will serialize in the background.
-    ///
-    /// This spawns a background thread and communicates back via a rendezvous channel.
-    pub background_serialization_threshold: usize,
-}
-
-impl Default for ConnectionConfig {
-    fn default() -> Self {
-        Self {
-            timeout: Some(Duration::from_secs(10)),
-            resend_delay: Duration::from_secs(1),
-            initial_send_batch_size: NonZeroBatchSize::new(8).unwrap(),
-            background_serialization_threshold: 8,
-        }
-    }
-}
-
-/// Server specific configuration.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct ServerConfig {
-    /// General connection related configuration.
-    pub connection: ConnectionConfig,
-    /// How long to wait between each ping.
-    ///
-    /// Should be considerably less than [`ConnectionConfig::timeout`] to avoid timeouts when there
-    /// aren't any other packets being sent for a while.
-    pub ping_delay: Duration,
-    /// How long to wait before a server forgets a client.
-    ///
-    /// This means the client will have to query its compatibility again. If set to [`None`] the
-    /// server will never forget any clients unless explicitly told to do so via [`Server::forget`].
-    pub listener_timeout: Option<Duration>,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            connection: Default::default(),
-            ping_delay: Duration::from_secs(3),
-            listener_timeout: None,
-        }
-    }
-}
-
 pub type NonZeroBatchSize = NonZeroU16;
 pub type BatchSize = u16;
 
@@ -354,11 +297,12 @@ impl<S: Packet, R: Packet> PacketBuffers<S, R> {
 
     pub(crate) fn update(
         &mut self,
-        timeout: Duration,
         resend_delay: Duration,
+        max_missed_acks: Option<usize>,
+        receive_timeout: Option<Duration>,
         socket: impl NonBlocking,
     ) -> io::Result<()> {
-        self.timeout_packets(timeout);
+        self.timeout_packets(max_missed_acks, receive_timeout);
         self.send_pending(resend_delay, socket)?;
         Ok(())
     }
@@ -394,9 +338,17 @@ impl<S: Packet, R: Packet> PacketBuffers<S, R> {
         self.send_buffer.send_pending(resend_delay, socket)
     }
 
-    fn timeout_packets(&mut self, timeout: Duration) {
-        self.send_buffer.timeout_packets(timeout);
-        self.receive_buffer.timeout_packets(timeout);
+    fn timeout_packets(
+        &mut self,
+        max_missed_acks: Option<usize>,
+        receive_timeout: Option<Duration>,
+    ) {
+        if let Some(max_missed_acks) = max_missed_acks {
+            self.send_buffer.timeout_packets(max_missed_acks);
+        }
+        if let Some(receive_timeout) = receive_timeout {
+            self.receive_buffer.timeout_packets(receive_timeout);
+        }
     }
 }
 
@@ -543,14 +495,9 @@ impl SendPacketBuffer {
     }
 
     /// Forget packets that did not get acks in a long time.
-    fn timeout_packets(&mut self, timeout: Duration) {
-        self.packets.retain(|id, packet| {
-            let within_timeout = packet.awaiting_ack_since().elapsed() < timeout;
-            if !within_timeout {
-                println!("{id:?} timed out because it did not get acks in {timeout:?}");
-            }
-            within_timeout
-        });
+    fn timeout_packets(&mut self, max_missed_acks: usize) {
+        self.packets
+            .retain(|_, packet| packet.missed_acks() <= max_missed_acks);
     }
 }
 
@@ -695,10 +642,14 @@ impl ReceivePacketBuffer {
                 }
             }
         } else {
-            let packet = self.packets.entry(id).or_insert_with(|| PacketIn {
-                last_receive: Instant::now(),
-                packet: Some(ReassembledPacket::new()),
-            });
+            let packet = self
+                .packets
+                .entry(id)
+                .and_modify(|packet| packet.last_receive = Instant::now())
+                .or_insert_with(|| PacketIn {
+                    last_receive: Instant::now(),
+                    packet: Some(ReassembledPacket::new()),
+                });
             if let Some(packet) = &mut packet.packet {
                 let received_packet = packet.receive(last, seq_index, payload);
                 ack(id, seq_index, socket)?;
@@ -727,13 +678,8 @@ impl ReceivePacketBuffer {
 
     /// Forget packets that did not receive data in a long time.
     fn timeout_packets(&mut self, timeout: Duration) {
-        self.packets.retain(|id, packet| {
-            let within_timeout = packet.last_receive.elapsed() < timeout;
-            if !within_timeout {
-                println!("{id:?} timed out because it did not get new data in {timeout:?}");
-            }
-            within_timeout
-        });
+        self.packets
+            .retain(|_, packet| packet.last_receive.elapsed() < timeout);
     }
 }
 

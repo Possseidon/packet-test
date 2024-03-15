@@ -26,8 +26,11 @@ pub(crate) struct PacketOut {
     ///
     /// Set to [`None`] if the packet was canceled.
     last_send: Option<Instant>,
-    /// Updated whenever and ack is received; used to time out old packets.
-    awaiting_ack_since: Instant,
+    /// How many times a packet had to be resent because it was not acked in time.
+    ///
+    /// - Incremented whenever a packet is resent.
+    /// - Reset whenever a packet is acked, even for duplicates.
+    missed_acks: usize,
     /// Up to how many packets are sent at once.
     batch_size: NonZeroBatchSize,
     /// How many packets were sent in the last batch.
@@ -35,6 +38,10 @@ pub(crate) struct PacketOut {
     /// Can be zero if the socket is busy and would block.
     last_batch_size: BatchSize,
     /// How many acks have been received for the last batch.
+    ///
+    /// Might be greater than [`Self::last_batch_size`] if a misbehaving client acked packets that
+    /// were never sent out. The sender does not remember which packets were already sent out, so
+    /// this has to be kept in mind.
     last_batch_acks: BatchSize,
 }
 
@@ -45,12 +52,11 @@ impl PacketOut {
         initial_batch_size: NonZeroBatchSize,
     ) -> io::Result<Self> {
         let mut packet_queue = PacketQueue::new(packet);
-        let (last_batch_size, _) = packet_queue.send_unacked(initial_batch_size, socket)?;
-        let now = Instant::now();
+        let (last_batch_size, sent) = packet_queue.send_unacked(initial_batch_size, socket)?;
         Ok(Self {
             packet_queue,
-            last_send: Some(now),
-            awaiting_ack_since: now,
+            last_send: sent.then(Instant::now),
+            missed_acks: 0,
             batch_size: initial_batch_size,
             last_batch_size,
             last_batch_acks: 0,
@@ -59,7 +65,7 @@ impl PacketOut {
 
     /// Marks the given packet as acked and returns true if it was already acked previously.
     pub(crate) fn ack(&mut self, seq_index: SeqIndex) -> Result<bool, SeqIndexAckedBeforeSent> {
-        self.awaiting_ack_since = Instant::now();
+        self.missed_acks = 0;
 
         if self.packet_queue.ack(seq_index)? {
             return Ok(true);
@@ -93,6 +99,8 @@ impl PacketOut {
         match self.packet_queue.send_unacked(self.batch_size, socket)? {
             (0, true) => done(id, socket),
             (count, _) => {
+                self.missed_acks +=
+                    usize::from(self.last_batch_size.saturating_sub(self.last_batch_acks));
                 self.last_batch_size = count;
                 self.last_batch_acks = 0;
                 self.last_send = Some(Instant::now());
@@ -118,9 +126,8 @@ impl PacketOut {
         self.packet_queue.first_unacked * PART_PACKET_PAYLOAD_SIZE.get()
     }
 
-    /// Since when the sender is waiting for an ack.
-    pub(crate) fn awaiting_ack_since(&self) -> Instant {
-        self.awaiting_ack_since
+    pub(crate) fn missed_acks(&self) -> usize {
+        self.missed_acks
     }
 
     /// Up to this many packets are being sent at once.
@@ -144,7 +151,7 @@ impl PacketOut {
         last_batch_acks: BatchSize,
         last_batch_size: BatchSize,
     ) -> NonZeroBatchSize {
-        // acked_count might be greater if the client is pretending to receive packets that were
+        // last_batch_acks might be greater if the client is pretending to receive packets that were
         // never sent; since the sender does not remember which packets it sent, just ignore it
         if last_batch_acks >= last_batch_size {
             // all packets of the last batch were acked, try up to twice as much next time

@@ -1,5 +1,5 @@
 use std::{
-    io::{self, ErrorKind},
+    io,
     mem::replace,
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     time::Instant,
@@ -9,24 +9,23 @@ use rkyv::{check_archived_root, validation::validators::DefaultValidator, Archiv
 use thiserror::Error;
 
 use crate::{
+    config::ClientConfig,
     net::NonBlockingUdpSocket,
     packet::{
         receive::ReceivedPacket, ArchivedServerConnectionPacket, ClientConnectionPacket,
-        ClientPacketBuffers, ConnectionConfig, DefaultPackets, NonBlocking, NonZeroBatchSize,
-        PacketBuffers, PacketHandling, PacketId, PacketKind, Packets, ServerConnectionPacket,
-        VersionPacket, PACKET_BUFFER_SIZE,
+        ClientPacketBuffers, DefaultPackets, NonBlocking, NonZeroBatchSize, PacketBuffers,
+        PacketHandling, PacketId, PacketKind, Packets, ServerConnectionPacket, VersionPacket,
+        PACKET_BUFFER_SIZE,
     },
 };
 
 use super::{
-    BasicLogConnectionHandler, ConnectionHandler, DefaultConnectionHandler, HandlerError, PartInfo,
-    RawPacket,
+    recv, BasicLogConnectionHandler, ConnectionHandler, DefaultConnectionHandler, HandlerError,
+    PartInfo, RawPacket,
 };
 
-// TODO: Make sure I've used swap_remove to remove entries from the servers vector
-
 pub struct Client<P: Packets = DefaultPackets> {
-    config: ConnectionConfig,
+    config: ClientConfig,
     socket: UdpSocket,
     state: ClientState,
     /// Contains servers that the client is listening to.
@@ -46,10 +45,7 @@ impl<P: Packets> Client<P> {
         Self::with_config(Self::DEFAULT_ADDR, Default::default())
     }
 
-    pub fn with_config(
-        client_addr: impl ToSocketAddrs,
-        config: ConnectionConfig,
-    ) -> io::Result<Self> {
+    pub fn with_config(client_addr: impl ToSocketAddrs, config: ClientConfig) -> io::Result<Self> {
         let socket = UdpSocket::bind(client_addr)?;
         socket.set_nonblocking(true)?;
         Ok(Self {
@@ -134,7 +130,8 @@ impl<P: Packets> Client<P> {
         server_addr: SocketAddr,
         query: P::Query,
     ) -> Result<PacketId, QueryError> {
-        let background_serialization_threshold = self.config.background_serialization_threshold;
+        let background_serialization_threshold =
+            self.config.connection.background_serialization_threshold;
         let (listener, socket) = self.get_or_add_listener(server_addr)?;
         match &mut listener.state {
             ServerState::PendingVersion { .. } => Err(CompatibilityError::CompatibilityPending)?,
@@ -155,7 +152,8 @@ impl<P: Packets> Client<P> {
         if let ClientState::Disconnected = self.state {
             self.socket.connect(server_addr)?;
             let server_addr = self.socket.peer_addr()?;
-            let background_serialization_threshold = self.config.background_serialization_threshold;
+            let background_serialization_threshold =
+                self.config.connection.background_serialization_threshold;
             let (listener, socket) = self.get_or_add_listener(server_addr)?;
             match &mut listener.state {
                 ServerState::PendingVersion { .. } => {
@@ -184,7 +182,7 @@ impl<P: Packets> Client<P> {
                 ServerState::Compatible { buffers, .. } => {
                     let packet_id = buffers.send(
                         ClientConnectionPacket::Disconnect(disconnect),
-                        self.config.background_serialization_threshold,
+                        self.config.connection.background_serialization_threshold,
                         NonBlockingUdpSocket::new(&self.socket, listener.server_addr),
                     );
                     match packet_id {
@@ -215,7 +213,7 @@ impl<P: Packets> Client<P> {
                 ServerState::Compatible { buffers, .. } => {
                     let packet_id = buffers.send(
                         ClientConnectionPacket::User(packet),
-                        self.config.background_serialization_threshold,
+                        self.config.connection.background_serialization_threshold,
                         NonBlockingUdpSocket::new(&self.socket, listener.server_addr),
                     );
                     match packet_id {
@@ -250,23 +248,12 @@ impl<P: Packets> Client<P> {
             )
         });
 
-        let mut buf = [0; PACKET_BUFFER_SIZE];
-        loop {
-            if self.listeners.is_empty() {
+        let mut packet_buf = [0; PACKET_BUFFER_SIZE];
+        while let Some(result) = recv(&self.socket, &mut packet_buf, handler) {
+            let Ok((server_addr, buf)) = result else {
+                self.state = ClientState::Disconnected;
+                self.forget_all();
                 break;
-            }
-
-            let (buf, server_addr) = match self.socket.recv_from(&mut buf) {
-                Ok((size, server_addr)) => (&buf[..size], server_addr),
-                Err(error) => {
-                    if error.kind() == ErrorKind::WouldBlock {
-                        break;
-                    }
-                    self.state = ClientState::Disconnected;
-                    self.forget_all();
-                    handler.error(HandlerError::Recv(error));
-                    break;
-                }
             };
 
             let Some(index) = self
@@ -303,7 +290,7 @@ impl<P: Packets> Client<P> {
                     match handler.compatibility(version) {
                         Ok(()) => listener
                             .state
-                            .compatible(self.config.initial_send_batch_size),
+                            .compatible(self.config.connection.initial_send_batch_size),
                         Err(error) => listener.state.incompatible(error),
                     }
                 }
@@ -447,16 +434,18 @@ impl<P: Packets> Client<P> {
                 ServerState::Compatible {
                     last_interaction, ..
                 } => {
-                    if last_interaction.elapsed() > self.config.timeout {
-                        self.state = ClientState::Disconnected;
-                        handler.error(HandlerError::Timeout {
-                            peer_addr: listener.server_addr,
-                        });
-                        if let Err(error) = listener.refresh(&self.socket) {
-                            handler.error(HandlerError::Send {
-                                receiver_addr: listener.server_addr,
-                                error,
-                            })
+                    if let Some(timeout) = self.config.timeout {
+                        if last_interaction.elapsed() > timeout {
+                            self.state = ClientState::Disconnected;
+                            handler.error(HandlerError::Timeout {
+                                peer_addr: listener.server_addr,
+                            });
+                            if let Err(error) = listener.refresh(&self.socket) {
+                                handler.error(HandlerError::Send {
+                                    receiver_addr: listener.server_addr,
+                                    error,
+                                })
+                            }
                         }
                     }
                 }
@@ -685,14 +674,16 @@ impl<P: Packets> ServerListener<P> {
         socket: &UdpSocket,
         handler: &mut impl ClientHandler<P>,
         state: Option<&mut ClientState>,
-        config: &ConnectionConfig,
+        config: &ClientConfig,
     ) -> bool
     where
         <ServerConnectionPacket<P> as Archive>::Archived: for<'a> CheckBytes<DefaultValidator<'a>>,
     {
         match &mut self.state {
             ServerState::PendingVersion { last_version_query } => {
-                if last_version_query.is_some_and(|it| it.elapsed() > config.resend_delay) {
+                if last_version_query
+                    .is_some_and(|it| it.elapsed() >= config.connection.resend_delay)
+                {
                     match send_version_query(NonBlockingUdpSocket::new(socket, self.server_addr)) {
                         Ok(sent) => {
                             if sent {
@@ -714,8 +705,9 @@ impl<P: Packets> ServerListener<P> {
             }
             ServerState::Compatible { buffers, .. } => {
                 let result = buffers.update(
-                    config.timeout,
-                    config.resend_delay,
+                    config.connection.resend_delay,
+                    config.connection.max_missed_acks,
+                    config.connection.receive_timeout,
                     NonBlockingUdpSocket::new(socket, self.server_addr),
                 );
                 if let Err(error) = result {

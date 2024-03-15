@@ -151,3 +151,20 @@ impl NonBlocking for NonBlockingUdpSocket<'_> {
         }
     }
 }
+
+pub(crate) fn recv<'a>(
+    socket: &UdpSocket,
+    packet_buf: &'a mut [u8; 512],
+    handler: &mut impl ConnectionHandler,
+) -> Option<Result<(SocketAddr, &'a [u8]), ()>> {
+    Some(match socket.recv_from(packet_buf) {
+        Ok((size, addr)) => Ok((addr, &packet_buf[..size])),
+        Err(error) => {
+            if error.kind() == ErrorKind::WouldBlock {
+                return None;
+            }
+            handler.error(HandlerError::Recv(error));
+            return Some(Err(()));
+        }
+    })
+}

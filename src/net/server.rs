@@ -1,5 +1,6 @@
 use std::{
-    io::{self, ErrorKind},
+    collections::BTreeMap,
+    io,
     net::{SocketAddr, ToSocketAddrs, UdpSocket},
     time::Instant,
 };
@@ -8,14 +9,17 @@ use rkyv::{check_archived_root, validation::validators::DefaultValidator, Archiv
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::packet::{
-    receive::ReceivedPacket, ArchivedClientConnectionPacket, ClientConnectionPacket,
-    DefaultPackets, NonBlocking, PacketBuffers, PacketHandling, PacketId, PacketKind, Packets,
-    ServerConfig, ServerConnectionPacket, ServerPacketBuffers, VersionPacket, PACKET_BUFFER_SIZE,
+use crate::{
+    config::ServerConfig,
+    packet::{
+        receive::ReceivedPacket, ArchivedClientConnectionPacket, ClientConnectionPacket,
+        DefaultPackets, NonBlocking, PacketHandling, PacketId, PacketKind, Packets,
+        ServerConnectionPacket, ServerPacketBuffers, VersionPacket, PACKET_BUFFER_SIZE,
+    },
 };
 
 use super::{
-    BasicLogConnectionHandler, ConnectionHandler, DefaultConnectionHandler, HandlerError,
+    recv, BasicLogConnectionHandler, ConnectionHandler, DefaultConnectionHandler, HandlerError,
     NonBlockingUdpSocket, PartInfo, RawPacket,
 };
 
@@ -27,14 +31,16 @@ pub struct Server<P: Packets = DefaultPackets> {
     /// All clients that the server is listening to, excluding the ones that are connected.
     ///
     /// Clients get added to this list by sending a version query (an empty packet) and get removed
-    /// after [`ServerConfig::listener_timeout`].
-    listeners: Vec<ClientListener<P>>,
+    /// after [`ServerConfig::listener_timeout`]. Clients in this list are allowed to send status
+    /// queries and try connecting to the server.
+    listeners: BTreeMap<SocketAddr, ServerPacketBuffers<P>>,
     /// All clients that are connected to the server.
     ///
-    /// Clients get moved from `listeners` to this list when they try to connect. Connected clients
-    /// cannot move position, since the order is also used by entity change tracking. Instead, they
-    /// are simply set to [`None`] upon disconnection and can be reused by new connections.
-    connections: Vec<Option<ConnectedClient<P>>>,
+    /// Listeners are upgraded to clients (and moved to this list) when they try to connect.
+    /// Connected clients cannot move position, since the order is also used by entity change
+    /// tracking. Instead, they are simply set to [`None`] upon disconnection and can be reused by
+    /// new clients.
+    clients: Vec<Option<ClientConnection<P>>>,
 }
 
 impl<P: Packets> Server<P> {
@@ -52,16 +58,34 @@ impl<P: Packets> Server<P> {
             config,
             socket,
             listeners: Default::default(),
-            connections: Default::default(),
+            clients: Default::default(),
         })
     }
 
+    pub fn unlisten(&mut self, client_addr: SocketAddr) -> Result<bool, UnlistenError> {
+        if self.listeners.remove(&client_addr).is_some() {
+            Ok(true)
+        } else if self
+            .clients
+            .iter()
+            .flatten()
+            .any(|client| client.client_addr == client_addr)
+        {
+            Err(UnlistenError)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn unlisten_all(&mut self) {
+        self.listeners.clear();
+    }
+
     pub fn client(&mut self, client_addr: SocketAddr) -> Option<Client<P>> {
-        self.listeners
+        self.clients
             .iter_mut()
             .flatten()
-            .find(|connection| connection.client_addr == client_addr)
-            .and_then(|connection| connection.client.as_mut())
+            .find(|client| client.client_addr == client_addr)
             .map(|client| Client {
                 socket: &self.socket,
                 client_addr,
@@ -77,151 +101,148 @@ impl<P: Packets> Server<P> {
     where
         <ClientConnectionPacket<P> as Archive>::Archived: for<'a> CheckBytes<DefaultValidator<'a>>,
     {
-        for connection_entry in self.listeners.iter_mut() {
-            let Some(connection) = connection_entry else {
+        self.update_buffers(handler);
+        self.handle_packets(handler);
+    }
+
+    /// Updates client buffers so they send pending packets and time out stale ones.
+    fn update_buffers(&mut self, handler: &mut impl ServerHandler<P>) {
+        let mut first_empty_slot = 0;
+        for (index, client_entry) in self.clients.iter_mut().enumerate() {
+            let Some(client) = client_entry else {
                 continue;
             };
-            let result = connection.buffers.update(
-                self.config.connection.timeout,
+            first_empty_slot = index + 1;
+            let result = client.buffers.update(
                 self.config.connection.resend_delay,
-                NonBlockingUdpSocket::new(&self.socket, connection.client_addr),
+                self.config.connection.max_missed_acks,
+                self.config.connection.receive_timeout,
+                NonBlockingUdpSocket::new(&self.socket, client.client_addr),
             );
-            match result {
-                Ok(()) => {}
-                Err(error) => {
-                    if error.kind() == ErrorKind::WouldBlock {
-                        // give the socket some time to empty its buffer
-                        break;
-                    }
-                    handler.error(HandlerError::Send {
-                        receiver_addr: connection.client_addr,
-                        error,
-                    });
-                    *connection_entry = None;
-                }
+            if let Err(error) = result {
+                handler.error(HandlerError::Send {
+                    receiver_addr: client.client_addr,
+                    error,
+                });
+                *client_entry = None;
             }
         }
+        self.clients.truncate(first_empty_slot);
+        // TODO: self.clients.shrink_to_fit() if capacity is vastly bigger than len
+    }
 
+    /// Deals with incoming packets.
+    fn handle_packets(&mut self, handler: &mut impl ServerHandler<P>)
+    where
+        <ClientConnectionPacket<P> as Archive>::Archived: for<'a> CheckBytes<DefaultValidator<'a>>,
+    {
         let mut packet_buf = [0; PACKET_BUFFER_SIZE];
-        loop {
-            let (buf, client_addr) = match self.socket.recv_from(&mut packet_buf) {
-                Ok((size, addr)) => (&packet_buf[..size], addr),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    break;
-                }
-                Err(error) => {
-                    handler.error(HandlerError::Recv(error));
-                    break;
-                }
-            };
+        while let Some(Ok((client_addr, buf))) = recv(&self.socket, &mut packet_buf, handler) {
+            let listening = self.listeners.contains_key(&client_addr);
 
-            let is_version_request = buf.is_empty();
-
-            let connection_entry = self.listeners.iter_mut().find(|connection| {
-                connection
-                    .as_ref()
-                    .is_some_and(|connection| connection.client_addr == client_addr)
-            });
-
-            let Some(connection_entry) = connection_entry else {
-                if !is_version_request {
-                    handler.unexpected(client_addr, UnexpectedClientPacket::UnknownCompatibility);
-                    continue;
-                }
-
-                match Self::send_version(&self.socket, &mut packet_buf, handler, client_addr) {
-                    Ok(sent) => {
-                        if !sent {
-                            continue;
-                        }
-                        let now = Instant::now();
-                        self.listeners.push(Some(ClientListener {
-                            connected: false,
-                            client_addr,
-                            ping_id: Uuid::new_v4(),
-                            ping: now,
-                            pong: None,
-                            buffers: PacketBuffers::new(
-                                self.config.connection.initial_send_batch_size,
-                            ),
-                        }));
-                    }
-                    Err(error) => {
-                        handler.error(HandlerError::Send {
-                            receiver_addr: client_addr,
-                            error,
-                        });
-                    }
-                }
-                continue;
-            };
-
-            let connection = connection_entry.as_mut().unwrap();
-
-            if is_version_request {
-                if let Err(error) =
-                    Self::send_version(&self.socket, &mut packet_buf, handler, client_addr)
-                {
-                    handler.error(HandlerError::Send {
-                        receiver_addr: client_addr,
-                        error,
-                    });
-                }
-                // just try again the next time if it couldn't be sent
+            if buf.is_empty() {
+                self.handle_version_request(&mut packet_buf, handler, client_addr, listening);
                 continue;
             }
 
-            let packet_handling = connection
-                .buffers
-                .handle(buf, NonBlockingUdpSocket::new(&self.socket, client_addr));
-
-            let packet_handling = match packet_handling {
-                Ok(packet_handling) => packet_handling,
-                Err(error) => {
-                    handler.error(HandlerError::Handle {
-                        sender_addr: client_addr,
-                        error,
-                    });
+            // look for clients first (most packets should generally come from connected clients)
+            if let Some(client_entry) = self.clients.iter_mut().find(|client_entry| {
+                client_entry
+                    .as_ref()
+                    .is_some_and(|client| client.client_addr == client_addr)
+            }) {
+                let buffers = &mut client_entry.as_mut().unwrap().buffers;
+                let Some(packet) =
+                    Self::handle_buffers(buffers, buf, &self.socket, client_addr, handler)
+                else {
                     continue;
+                };
+
+                let disconnect = match packet {
+                    ArchivedClientConnectionPacket::Query(query) => {
+                        let status = handler.query(client_addr, query);
+                        let result = buffers.send(
+                            ServerConnectionPacket::Status(status),
+                            self.config.connection.background_serialization_threshold,
+                            NonBlockingUdpSocket::new(&self.socket, client_addr),
+                        );
+                        if let Err(error) = result {
+                            handler.error(HandlerError::Send {
+                                receiver_addr: client_addr,
+                                error,
+                            });
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    ArchivedClientConnectionPacket::Connect(_) => {
+                        handler.unexpected(client_addr, UnexpectedClientPacket::AlreadyConnected);
+                        true
+                    }
+                    ArchivedClientConnectionPacket::Disconnect(disconnect) => {
+                        handler.disconnect(client_addr, disconnect);
+                        true
+                    }
+                    ArchivedClientConnectionPacket::User(user) => {
+                        handler.packet(client_addr, user);
+                        false
+                    }
+                };
+
+                if disconnect {
+                    let client = client_entry.take().unwrap();
+                    self.listeners.insert(client.client_addr, client.buffers);
                 }
-            };
 
-            match packet_handling {
-                PacketHandling::Received(ack) => match ack {
-                    ReceivedPacket::Pending => {
-                        handler.raw_packet(RawPacket::Part {
-                            sender_addr: client_addr,
-                            info: PartInfo::Pending,
-                        });
-                    }
-                    ReceivedPacket::Duplicate => {
-                        handler.raw_packet(RawPacket::Part {
-                            sender_addr: client_addr,
-                            info: PartInfo::Duplicate,
-                        });
-                    }
-                    ReceivedPacket::Reassembled(bytes) => {
-                        handler.raw_packet(RawPacket::Part {
-                            sender_addr: client_addr,
-                            info: PartInfo::Reassembled,
-                        });
+                continue;
+            }
 
-                        let packet = check_archived_root::<ClientConnectionPacket<P>>(bytes);
-                        let packet = match packet {
-                            Ok(packet) => packet,
-                            Err(error) => {
-                                handler.error(HandlerError::PacketValidation {
-                                    sender_addr: client_addr,
-                                    error: Box::new(error),
-                                });
-                                continue;
+            if let Some(buffers) = self.listeners.get_mut(&client_addr) {
+                let Some(packet) =
+                    Self::handle_buffers(buffers, buf, &self.socket, client_addr, handler)
+                else {
+                    continue;
+                };
+
+                match packet {
+                    ArchivedClientConnectionPacket::Query(query) => {
+                        let status = handler.query(client_addr, query);
+                        let result = buffers.send(
+                            ServerConnectionPacket::Status(status),
+                            self.config.connection.background_serialization_threshold,
+                            NonBlockingUdpSocket::new(&self.socket, client_addr),
+                        );
+                        if let Err(error) = result {
+                            handler.error(HandlerError::Send {
+                                receiver_addr: client_addr,
+                                error,
+                            });
+                        }
+                    }
+                    ArchivedClientConnectionPacket::Connect(connect) => {
+                        match handler.connect(client_addr, connect) {
+                            Connect::Accept(accept) => {
+                                let result = buffers.send(
+                                    ServerConnectionPacket::Accept(accept),
+                                    self.config.connection.background_serialization_threshold,
+                                    NonBlockingUdpSocket::new(&self.socket, client_addr),
+                                );
+                                if let Err(error) = result {
+                                    handler.error(HandlerError::Send {
+                                        receiver_addr: client_addr,
+                                        error,
+                                    });
+                                } else {
+                                    *self.get_or_add_free_slot() = Some(ClientConnection::new(
+                                        client_addr,
+                                        self.listeners.remove(&client_addr).unwrap(),
+                                    ));
+                                }
                             }
-                        };
-                        match packet {
-                            ArchivedClientConnectionPacket::Query(query) => {
-                                let status = handler.query(client_addr, query);
-                                let result = connection.buffers.send(
-                                    ServerConnectionPacket::Status(status),
+                            Connect::Reject(reject) => {
+                                let result = buffers.send(
+                                    ServerConnectionPacket::Reject(reject),
                                     self.config.connection.background_serialization_threshold,
                                     NonBlockingUdpSocket::new(&self.socket, client_addr),
                                 );
@@ -231,95 +252,59 @@ impl<P: Packets> Server<P> {
                                         error,
                                     });
                                 }
-                                if !connection.connected {
-                                    *connection_entry = None;
-                                }
-                            }
-                            ArchivedClientConnectionPacket::Connect(connect) => {
-                                if connection.connected {
-                                    handler.unexpected(
-                                        client_addr,
-                                        UnexpectedClientPacket::AlreadyConnected,
-                                    );
-                                } else {
-                                    match handler.connect(client_addr, connect) {
-                                        Connect::Accept(accept) => {
-                                            let result = connection.buffers.send(
-                                                ServerConnectionPacket::Accept(accept),
-                                                self.config
-                                                    .connection
-                                                    .background_serialization_threshold,
-                                                NonBlockingUdpSocket::new(
-                                                    &self.socket,
-                                                    client_addr,
-                                                ),
-                                            );
-                                            if let Err(error) = result {
-                                                handler.error(HandlerError::Send {
-                                                    receiver_addr: client_addr,
-                                                    error,
-                                                })
-                                            }
-                                            connection.connected = true;
-                                        }
-                                        Connect::Reject(reject) => {
-                                            let result = connection.buffers.send(
-                                                ServerConnectionPacket::Reject(reject),
-                                                self.config
-                                                    .connection
-                                                    .background_serialization_threshold,
-                                                NonBlockingUdpSocket::new(
-                                                    &self.socket,
-                                                    client_addr,
-                                                ),
-                                            );
-                                            if let Err(error) = result {
-                                                handler.error(HandlerError::Send {
-                                                    receiver_addr: client_addr,
-                                                    error,
-                                                })
-                                            }
-                                            *connection_entry = None;
-                                        }
-                                    }
-                                }
-                            }
-                            ArchivedClientConnectionPacket::Disconnect(disconnect) => {
-                                if connection.connected {
-                                    handler.disconnect(client_addr, disconnect);
-                                } else {
-                                    handler.unexpected(
-                                        client_addr,
-                                        UnexpectedClientPacket::NotConnected,
-                                    );
-                                }
-                                *connection_entry = None;
-                            }
-                            ArchivedClientConnectionPacket::User(packet) => {
-                                if connection.connected {
-                                    handler.packet(client_addr, packet);
-                                } else {
-                                    handler.unexpected(
-                                        client_addr,
-                                        UnexpectedClientPacket::NotConnected,
-                                    )
-                                }
                             }
                         }
                     }
-                },
-                PacketHandling::Done { known_packet } => {
-                    handler.raw_packet(RawPacket::Done {
-                        sender_addr: client_addr,
-                        known_packet,
-                    });
+                    ArchivedClientConnectionPacket::Disconnect(_)
+                    | ArchivedClientConnectionPacket::User(_) => {
+                        handler.unexpected(client_addr, UnexpectedClientPacket::NotConnected)
+                    }
                 }
-                PacketHandling::Ack { duplicate } => {
-                    handler.raw_packet(RawPacket::Ack {
-                        receiver_addr: client_addr,
-                        duplicate,
-                    });
+
+                continue;
+            }
+
+            handler.unexpected(client_addr, UnexpectedClientPacket::UnknownCompatibility);
+        }
+    }
+
+    fn get_or_add_free_slot(&mut self) -> &mut Option<ClientConnection<P>> {
+        if let Some(index) = self.clients.iter().position(Option::is_none) {
+            &mut self.clients[index]
+        } else {
+            self.clients.push(None);
+            self.clients.last_mut().unwrap()
+        }
+    }
+
+    fn handle_version_request(
+        &mut self,
+        packet_buf: &mut [u8; PACKET_BUFFER_SIZE],
+        handler: &mut impl ServerHandler<P>,
+        client_addr: SocketAddr,
+        listening: bool,
+    ) {
+        match Self::send_version(&self.socket, packet_buf, handler, client_addr) {
+            Ok(sent) => {
+                if sent
+                    && !listening
+                    && !self
+                        .clients
+                        .iter()
+                        .flatten()
+                        .any(|client| client.client_addr == client_addr)
+                {
+                    self.listeners.insert(
+                        client_addr,
+                        ServerPacketBuffers::new(self.config.connection.initial_send_batch_size),
+                    );
                 }
+            }
+            Err(error) => {
+                handler.error(HandlerError::Send {
+                    receiver_addr: client_addr,
+                    error,
+                });
             }
         }
     }
@@ -335,6 +320,67 @@ impl<P: Packets> Server<P> {
         let buf = &packet_buf[..version_len + 1];
         NonBlockingUdpSocket::new(socket, client_addr).send(buf)
     }
+
+    fn handle_buffers<'a>(
+        buffers: &'a mut ServerPacketBuffers<P>,
+        buf: &'a [u8],
+        socket: &UdpSocket,
+        client_addr: SocketAddr,
+        handler: &mut impl ServerHandler<P>,
+    ) -> Option<&'a ArchivedClientConnectionPacket<P>>
+    where
+        <ClientConnectionPacket<P> as Archive>::Archived: for<'b> CheckBytes<DefaultValidator<'b>>,
+    {
+        let packet_handling = buffers.handle(buf, NonBlockingUdpSocket::new(socket, client_addr));
+        let packet_handling = match packet_handling {
+            Ok(packet_handling) => packet_handling,
+            Err(error) => {
+                handler.error(HandlerError::Handle {
+                    sender_addr: client_addr,
+                    error,
+                });
+                return None;
+            }
+        };
+
+        match packet_handling {
+            PacketHandling::Received(packet) => match packet {
+                ReceivedPacket::Pending => handler.raw_packet(RawPacket::Part {
+                    sender_addr: client_addr,
+                    info: PartInfo::Pending,
+                }),
+                ReceivedPacket::Duplicate => handler.raw_packet(RawPacket::Part {
+                    sender_addr: client_addr,
+                    info: PartInfo::Duplicate,
+                }),
+                ReceivedPacket::Reassembled(bytes) => {
+                    handler.raw_packet(RawPacket::Part {
+                        sender_addr: client_addr,
+                        info: PartInfo::Reassembled,
+                    });
+
+                    let packet = check_archived_root::<ClientConnectionPacket<P>>(bytes);
+                    match packet {
+                        Ok(packet) => return Some(packet),
+                        Err(error) => handler.error(HandlerError::PacketValidation {
+                            sender_addr: client_addr,
+                            error: Box::new(error),
+                        }),
+                    }
+                }
+            },
+            PacketHandling::Done { known_packet } => handler.raw_packet(RawPacket::Done {
+                sender_addr: client_addr,
+                known_packet,
+            }),
+            PacketHandling::Ack { duplicate } => handler.raw_packet(RawPacket::Ack {
+                receiver_addr: client_addr,
+                duplicate,
+            }),
+        }
+
+        None
+    }
 }
 
 impl<P: Packets> std::fmt::Debug for Server<P> {
@@ -342,7 +388,8 @@ impl<P: Packets> std::fmt::Debug for Server<P> {
         f.debug_struct("Server")
             .field("config", &self.config)
             .field("socket", &self.socket)
-            .field("connections", &self.listeners)
+            .field("listeners", &self.listeners)
+            .field("clients", &self.clients)
             .finish()
     }
 }
@@ -513,11 +560,13 @@ pub enum UnexpectedClientPacket {
     UnknownCompatibility,
     #[error("not connected to this client")]
     NotConnected,
-    #[error("incompatible with this client")]
-    Incompatible,
     #[error("already connected to this client")]
     AlreadyConnected,
 }
+
+#[derive(Debug, Error)]
+#[error("cannot unlisten a connected client")]
+pub struct UnlistenError;
 
 pub struct Client<'a, P: Packets> {
     socket: &'a UdpSocket,
@@ -540,37 +589,52 @@ impl<'a, P: Packets> Client<'a, P> {
     }
 }
 
-struct ClientListener<P: Packets> {
+struct ClientConnection<P: Packets> {
     client_addr: SocketAddr,
-    client: Option<ConnectedClient<P>>,
-}
-
-impl<P: Packets> std::fmt::Debug for ClientListener<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientListener")
-            .field("client_addr", &self.client_addr)
-            .field("client", &self.client)
-            .finish()
-    }
-}
-
-struct ConnectedClient<P: Packets> {
-    client_addr: SocketAddr,
-    ping_id: Uuid,
-    ping: Instant,
-    pong: Option<Instant>,
     buffers: ServerPacketBuffers<P>,
+    /// The current ping sent out to the client.
+    ///
+    /// Might be `None` if it failed to send because the socket would have blocked.
+    ///
+    /// Will be kept around even after a pong was received to know when to send the next one. New
+    /// pings will be sent out, even if the client hasn't responded to this one yet.
+    active_ping: Option<ActivePing>,
+    /// The last time the client responded to a ping.
+    last_ping: Option<Instant>,
+    /// How many pings the client has not responded to in a row.
+    ///
+    /// Reset whenever a pong is received. Used to time out clients.
+    missed_pings: usize,
     // TODO: Add a way to track which entities and things are known to be up to date:
     // updates: UpdateTracker,
 }
 
-impl<P: Packets> std::fmt::Debug for ConnectedClient<P> {
+impl<P: Packets> ClientConnection<P> {
+    fn new(client_addr: SocketAddr, buffers: ServerPacketBuffers<P>) -> ClientConnection<P> {
+        Self {
+            client_addr,
+            buffers,
+            active_ping: None,
+            last_ping: None,
+            missed_pings: 0,
+        }
+    }
+}
+
+impl<P: Packets> std::fmt::Debug for ClientConnection<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectedClient")
-            .field("ping_id", &self.ping_id)
-            .field("ping", &self.ping)
-            .field("pong", &self.pong)
+        f.debug_struct("ClientConnection")
+            .field("client_addr", &self.client_addr)
             .field("buffers", &self.buffers)
+            .field("active_ping", &self.active_ping)
+            .field("last_ping", &self.last_ping)
+            .field("missed_pings", &self.missed_pings)
             .finish()
     }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ActivePing {
+    ping_id: Uuid,
+    ping: Instant,
 }

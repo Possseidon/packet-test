@@ -105,7 +105,7 @@ impl Fallible for ChannelPacketSerializer {
     type Error = ReceiverDropped;
 }
 
-struct ReceiverDropped;
+pub struct ReceiverDropped;
 
 impl Serializer for ChannelPacketSerializer {
     fn pos(&self) -> usize {
