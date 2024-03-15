@@ -87,7 +87,7 @@ pub trait Packets: 'static {
 pub struct DefaultPackets;
 
 impl Packets for DefaultPackets {
-    type Version = NoVersion;
+    type Version = ();
     type CompatibilityError = Infallible;
 
     type Query = ();
@@ -159,17 +159,14 @@ pub trait VersionPacket: Sized {
 }
 
 /// Does not contain any version information but only accepts empty packets in response as well.
-#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
-pub struct NoVersion;
-
-impl VersionPacket for NoVersion {
+impl VersionPacket for () {
     fn write(&self, _buf: &mut [u8]) -> usize {
         0
     }
 
     fn read(buf: &[u8]) -> Result<Self, MalformedVersion> {
         if buf.is_empty() {
-            Ok(NoVersion)
+            Ok(())
         } else {
             Err(MalformedVersion)
         }
