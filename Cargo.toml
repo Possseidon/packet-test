@@ -7,6 +7,12 @@ edition = "2021"
 anyhow = "1.0.80"
 bitvec = "1.0.1"
 num_enum = "0.7.2"
-rkyv = { version = "0.7.44", features = ["validation", "archive_le"] }
+rkyv = { version = "0.7.44", features = ["validation", "strict"] }
 thiserror = "1.0.57"
 uuid = { version = "1.7.0", features = ["v4"] }
+
+[features]
+default = ["packet_le"]
+packet_le = ["rkyv/archive_le"]
+packet_be = ["rkyv/archive_be"]
+packet_ne = []
